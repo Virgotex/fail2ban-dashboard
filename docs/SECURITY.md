@@ -29,16 +29,56 @@ fail2ban.local {
 
 Then access via `https://fail2ban.local` (add to `/etc/hosts` if needed).
 
-## 3. Add OIDC authentication
+## 3. Enable OIDC authentication (built-in)
 
-For any access beyond your own laptop, add an auth proxy like Authentik or use
-the `express-openid-connect` package:
+`express-openid-connect` is already wired in — flip `OIDC_ENABLED=true` and
+fill in the matching env vars. The backend then:
 
-```bash
-cd backend && npm install express-openid-connect
+- Forces every API route through a session login (any IdP that speaks OIDC).
+- If `OIDC_REQUIRED_GROUP` is set, restricts ban/unban to users with that
+  claim. Reads stay available to any authenticated user.
+- Emits an `[AUDIT]` JSON line on every write, attributed to the OIDC `sub`.
+- Hands the WebSocket a short-lived single-use ticket instead of the API
+  secret, so the secret never leaves the server in OIDC mode.
+
+### Minimum env vars
+
+```env
+OIDC_ENABLED=true
+OIDC_ISSUER_BASE_URL=https://idp.example.com/realms/company
+OIDC_CLIENT_ID=fail2ban-dashboard
+OIDC_CLIENT_SECRET=...
+OIDC_BASE_URL=https://fail2ban.example.com    # public URL of THIS app
+OIDC_SECRET=$(node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')
+OIDC_REQUIRED_GROUP=fail2ban-admins           # optional
+OIDC_GROUPS_CLAIM=groups                      # default; override per IdP
 ```
 
-See: https://auth0.github.io/express-openid-connect/
+### IdP configuration cheatsheet
+
+| Provider | Redirect URI to register | Groups claim |
+|---|---|---|
+| Keycloak | `${OIDC_BASE_URL}/callback` | `groups` (after adding a Group Membership mapper to the client scope) |
+| Okta | `${OIDC_BASE_URL}/callback` | `groups` (assign via "Groups claim" in the app settings) |
+| Auth0 | `${OIDC_BASE_URL}/callback` | A namespaced claim, e.g. `https://example.com/groups` — set `OIDC_GROUPS_CLAIM` to match |
+| Azure AD | `${OIDC_BASE_URL}/callback` | `roles` — set `OIDC_GROUPS_CLAIM=roles` |
+| Authentik | `${OIDC_BASE_URL}/callback` | `groups` (default group mapper) |
+
+### Logout post-redirect
+
+The default post-logout redirect lands users back at `/`. To send them to the
+IdP's logout page instead, set `auth0Logout: true` in `server.js` and use
+`endSessionEndpoint` per provider docs.
+
+### Sanity check after setup
+
+```bash
+# Visit https://fail2ban.example.com — expect a redirect to the IdP.
+# After login the sidebar bottom-left should show your name + a logout icon.
+# Ban/unban a test IP and confirm an [AUDIT] line appears in journald with
+# user=<your-sub>.
+journalctl -u fail2ban-dashboard -e | grep AUDIT
+```
 
 ## 4. Rotate the API secret periodically
 

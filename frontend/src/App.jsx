@@ -1,7 +1,23 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts'
-import { ShieldCheck, ShieldOff, Activity, Lock, FileText, BarChart2, Settings, AlertTriangle, RefreshCw, Wifi, WifiOff, Trash2, Search, Terminal } from 'lucide-react'
-import { api, createWebSocket } from './hooks/useApi'
+import { ShieldCheck, ShieldOff, Activity, Lock, FileText, BarChart2, Settings, AlertTriangle, RefreshCw, Wifi, WifiOff, Trash2, Search, Terminal, Sun, Moon, LogOut, User } from 'lucide-react'
+import { api, createWebSocket, setAuthMode } from './hooks/useApi'
+
+// ─── Theme ───────────────────────────────────────────────────────────────
+// data-theme on <html> drives all CSS variables in index.css. The early
+// inline script in index.html sets the initial attribute so we never flash
+// the wrong theme on load.
+const THEME_KEY = 'fail2ban-theme'
+function useTheme() {
+  const [theme, setTheme] = useState(() =>
+    document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark'
+  )
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    try { localStorage.setItem(THEME_KEY, theme) } catch {}
+  }, [theme])
+  return [theme, () => setTheme(t => t === 'dark' ? 'light' : 'dark')]
+}
 
 const PIE_COLORS = ['#e24b4a','#f6ad55','#63b3ed','#48bb78','#9f7aea','#fc8181','#76e4f7']
 
@@ -20,9 +36,57 @@ const JAIL_META = {
 }
 const SEV_ORDER = ['CRITICAL','HIGH','MEDIUM','LOW','OBSERVED']
 
+// Auto-generate a plain-English explanation of why an IP was banned. All
+// inputs come from the existing /api/ip/:ip/details payload — no extra
+// backend call. Returns null if there's nothing meaningful to say.
+function explainBan(data) {
+  if (!data || !data.summary || !data.jailsHit) return null
+  const sorted = [...data.jailsHit].sort((a, b) => (b.bans - a.bans) || (b.attempts - a.attempts))
+  const primary = sorted[0]
+  const s = data.summary
+  if (!primary && s.totalAttempts === 0 && s.totalBans === 0) return null
+
+  const sentences = []
+  if (primary) {
+    const meta = JAIL_META[primary.name]
+    const intent = meta && meta.intent ? meta.intent.toLowerCase() : null
+    if (intent) sentences.push(`Caught by the \`${primary.name}\` jail — ${intent}.`)
+    else        sentences.push(`Caught by the \`${primary.name}\` jail.`)
+  }
+
+  const otherJails = sorted.slice(1).filter(j => j.bans > 0 || j.attempts > 0)
+  if (otherJails.length) {
+    sentences.push(`Also matched: ${otherJails.map(j => '`' + j.name + '`').join(', ')}.`)
+  }
+
+  if (s.totalAttempts > 0) {
+    sentences.push(`Logged ${s.totalAttempts} trigger event${s.totalAttempts === 1 ? '' : 's'} before the ban.`)
+  }
+
+  if (s.triedUsernames && s.triedUsernames.length) {
+    const shown = s.triedUsernames.slice(0, 5).map(u => `"${u}"`).join(', ')
+    const more  = s.triedUsernames.length > 5 ? ` and ${s.triedUsernames.length - 5} more` : ''
+    sentences.push(`Tried usernames: ${shown}${more}.`)
+  }
+
+  if (s.triedPorts && s.triedPorts.length) {
+    sentences.push(`Source port${s.triedPorts.length === 1 ? '' : 's'}: ${s.triedPorts.slice(0, 5).join(', ')}.`)
+  }
+
+  if (s.firstSeen && s.lastSeen && s.firstSeen !== s.lastSeen) {
+    sentences.push(`Activity window: ${s.firstSeen} → ${s.lastSeen}.`)
+  }
+
+  if (s.isRecurring) {
+    sentences.push(`Recurring offender — banned ${s.totalBans} times.`)
+  }
+
+  return sentences.join(' ')
+}
+
 // ─── Shared UI ────────────────────────────────────────────────────────────
 function Badge({ children, color='default' }) {
-  const map = { default:{bg:'rgba(255,255,255,0.07)',fg:'#7d8fa3'}, green:{bg:'rgba(72,187,120,0.15)',fg:'#48bb78'}, red:{bg:'rgba(226,75,74,0.15)',fg:'#ff6b6b'}, amber:{bg:'rgba(246,173,85,0.15)',fg:'#f6ad55'}, blue:{bg:'rgba(99,179,237,0.15)',fg:'#63b3ed'} }
+  const map = { default:{bg:'var(--border)',fg:'var(--text2)'}, green:{bg:'rgba(72,187,120,0.15)',fg:'var(--green)'}, red:{bg:'rgba(226,75,74,0.15)',fg:'var(--accent2)'}, amber:{bg:'rgba(246,173,85,0.15)',fg:'var(--amber)'}, blue:{bg:'rgba(99,179,237,0.15)',fg:'var(--blue)'} }
   const c = map[color]||map.default
   return <span style={{background:c.bg,color:c.fg,fontSize:10,fontWeight:500,padding:'2px 8px',borderRadius:20,fontFamily:'var(--mono)',whiteSpace:'nowrap'}}>{children}</span>
 }
@@ -60,8 +124,8 @@ function LoadingBox({ rows=4 }) {
 function ErrorBox({ message, onRetry }) {
   return (
     <div style={{margin:16,padding:'12px 16px',background:'rgba(226,75,74,0.08)',border:'0.5px solid rgba(226,75,74,0.3)',borderRadius:'var(--radius)',display:'flex',alignItems:'center',justifyContent:'space-between',fontSize:12}}>
-      <span style={{color:'#ff6b6b'}}><AlertTriangle size={12} style={{marginRight:6,verticalAlign:'middle'}}/>{message}</span>
-      {onRetry && <button onClick={onRetry} style={{background:'none',border:'0.5px solid rgba(226,75,74,0.4)',borderRadius:'var(--radius)',color:'#ff6b6b',fontSize:11,padding:'3px 10px',cursor:'pointer'}}>Retry</button>}
+      <span style={{color:'var(--accent2)'}}><AlertTriangle size={12} style={{marginRight:6,verticalAlign:'middle'}}/>{message}</span>
+      {onRetry && <button onClick={onRetry} style={{background:'none',border:'0.5px solid rgba(226,75,74,0.4)',borderRadius:'var(--radius)',color:'var(--accent2)',fontSize:11,padding:'3px 10px',cursor:'pointer'}}>Retry</button>}
     </div>
   )
 }
@@ -73,7 +137,7 @@ function ClickableIP({ ip, onInspect }) {
       onClick={() => onInspect(ip)}
       title={`Investigate ${ip}`}
       style={{fontFamily:'var(--mono)',fontSize:11,color:'var(--blue)',cursor:'pointer',borderBottom:'1px dashed rgba(99,179,237,0.4)',transition:'color .12s'}}
-      onMouseEnter={e=>e.currentTarget.style.color='#90cdf4'}
+      onMouseEnter={e=>e.currentTarget.style.color='var(--blue-hover)'}
       onMouseLeave={e=>e.currentTarget.style.color='var(--blue)'}
     >{ip}</span>
   )
@@ -92,10 +156,12 @@ function IPModal({ ip, onClose }) {
     setLoading(true); setData(null); setGeo(null); setError(null); setTab('summary')
     Promise.all([
       api.ipDetails(ip),
-      fetch(`http://ip-api.com/json/${ip}?fields=status,message,country,countryCode,regionName,city,isp,org,as,proxy,hosting,mobile,query`)
-        .then(r=>r.json()).catch(()=>null),
+      api.ipGeo(ip).catch(() => null),
     ])
-      .then(([details, geoData]) => { setData(details); if (geoData?.status==='success') setGeo(geoData) })
+      .then(([details, geoData]) => {
+        setData(details)
+        if (geoData && !geoData.disabled && geoData.status === 'success') setGeo(geoData)
+      })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
   }, [ip])
@@ -125,7 +191,7 @@ function IPModal({ ip, onClose }) {
       <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.72)',backdropFilter:'blur(3px)',zIndex:1000}}/>
 
       {/* Modal */}
-      <div style={{position:'fixed',top:'50%',left:'50%',transform:'translate(-50%,-50%)',width:740,maxWidth:'96vw',maxHeight:'90vh',background:'var(--bg2)',border:'0.5px solid var(--border2)',borderRadius:12,zIndex:1001,display:'flex',flexDirection:'column',overflow:'hidden',boxShadow:'0 24px 64px rgba(0,0,0,0.6)'}}>
+      <div style={{position:'fixed',top:'50%',left:'50%',transform:'translate(-50%,-50%)',width:740,maxWidth:'96vw',maxHeight:'90vh',background:'var(--bg2)',border:'0.5px solid var(--border2)',borderRadius:12,zIndex:1001,display:'flex',flexDirection:'column',overflow:'hidden',boxShadow:'var(--shadow)'}}>
 
         {/* Header */}
         <div style={{padding:'14px 18px',borderBottom:'0.5px solid var(--border)',display:'flex',alignItems:'center',justifyContent:'space-between',background:'var(--bg3)',flexShrink:0}}>
@@ -160,6 +226,20 @@ function IPModal({ ip, onClose }) {
             {/* SUMMARY */}
             {tab==='summary' && (
               <div style={{display:'flex',flexDirection:'column',gap:12}}>
+
+                {/* Why banned — auto-generated narrative */}
+                {(() => {
+                  const why = explainBan(data)
+                  if (!why) return null
+                  return (
+                    <div style={{background:'rgba(226,75,74,0.06)',border:'0.5px solid rgba(226,75,74,0.25)',borderRadius:8,padding:'12px 14px'}}>
+                      <div style={{fontSize:10,fontWeight:700,color:'var(--accent2)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.06em',fontFamily:'var(--mono)'}}>
+                        Why banned
+                      </div>
+                      <div style={{fontSize:12,lineHeight:1.65,color:'var(--text)'}}>{why}</div>
+                    </div>
+                  )
+                })()}
 
                 {/* Stats */}
                 <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}}>
@@ -457,7 +537,7 @@ function Reports({ onInspect }) {
                 <BarChart data={data.dailyBans} margin={{top:0,right:8,left:-20,bottom:0}}>
                   <XAxis dataKey="day" tick={{fill:'#4a5568',fontSize:10}} axisLine={false} tickLine={false}/>
                   <YAxis tick={{fill:'#4a5568',fontSize:10}} axisLine={false} tickLine={false} allowDecimals={false}/>
-                  <Tooltip contentStyle={{background:'var(--bg3)',border:'0.5px solid var(--border)',borderRadius:6,fontSize:11}} cursor={{fill:'rgba(255,255,255,.04)'}} formatter={v=>[v,'Bans']} labelFormatter={(_,p)=>p?.[0]?.payload?.date||''}/>
+                  <Tooltip contentStyle={{background:'var(--bg3)',border:'0.5px solid var(--border)',borderRadius:6,fontSize:11}} cursor={{fill:'var(--hover-tint)'}} formatter={v=>[v,'Bans']} labelFormatter={(_,p)=>p?.[0]?.payload?.date||''}/>
                   <Bar dataKey="bans" fill="#e24b4a" radius={[3,3,0,0]}/>
                 </BarChart>
               </ResponsiveContainer>
@@ -581,26 +661,15 @@ function BannedIPs({ jails, onUnban, onInspect }) {
 
 // ─── Settings ─────────────────────────────────────────────────────────────
 function SettingsPage() {
-  const [config,loading,error,fetchConfig] = useFetch(api.config)
-  useEffect(()=>{ fetchConfig() },[])
-
-  const checks = [
-    {ok:true,  text:'Backend binds to 127.0.0.1 only'},
-    {ok:true,  text:'Rate limiting: 100 req/min global, 20/min writes'},
-    {ok:true,  text:'Helmet security headers (XSS, HSTS, CSP, no-sniff)'},
-    {ok:true,  text:'CORS restricted to localhost origin only'},
-    {ok:true,  text:'Strict IP/CIDR validation on all ban/unban calls'},
-    {ok:true,  text:'WebSocket: origin check + API key on every upgrade'},
-    {ok:true,  text:'execFile arg arrays — no shell injection possible'},
-    {ok:false, text:'OIDC not configured — required for LAN/multi-user access'},
-    {ok:false, text:'No TLS — use Caddy or Nginx reverse proxy for HTTPS'},
-  ]
+  const [config,   loadingCfg, errorCfg, fetchConfig]   = useFetch(api.config)
+  const [security, loadingSec, errorSec, fetchSecurity] = useFetch(api.security)
+  useEffect(()=>{ fetchConfig(); fetchSecurity() },[])
 
   return (
     <div className="fade-in" style={{display:'flex',flexDirection:'column',gap:14}}>
       <Card>
         <SectionHeader icon={Terminal} title="Live daemon config" right={<Badge color="blue">from fail2ban-client</Badge>}/>
-        {loading ? <LoadingBox rows={3}/> : error ? <ErrorBox message={error} onRetry={fetchConfig}/> : (
+        {loadingCfg ? <LoadingBox rows={3}/> : errorCfg ? <ErrorBox message={errorCfg} onRetry={fetchConfig}/> : (
           <div style={{padding:'14px 16px',display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:12}}>
             {config && Object.entries(config).map(([k,v])=>(
               <div key={k}>
@@ -611,13 +680,51 @@ function SettingsPage() {
           </div>
         )}
       </Card>
+
       <Card>
-        <SectionHeader icon={ShieldCheck} title="Security posture"/>
+        <SectionHeader icon={Terminal} title="Backend runtime" right={<Badge color="blue">from /api/security</Badge>}/>
+        {loadingSec ? <LoadingBox rows={4}/> : errorSec ? <ErrorBox message={errorSec} onRetry={fetchSecurity}/> : security && (
+          <div style={{padding:'14px 16px',display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+            {[
+              ['Bind address',     security.runtime.bindAddress],
+              ['Port',             String(security.runtime.port)],
+              ['Allowed origin',   security.runtime.allowedOrigin],
+              ['NODE_ENV',         security.runtime.nodeEnv],
+              ['Trust proxy',      String(security.runtime.trustProxy)],
+              ['Rate limit',       `${security.runtime.rateLimit.max}/${security.runtime.rateLimit.windowMs/1000}s · writes ${security.runtime.rateLimit.writeMax}/min`],
+              ['Geo lookup',       security.runtime.geoLookupEnabled ? 'enabled (server-side proxy)' : 'disabled'],
+              ['fail2ban via sudo',security.runtime.useSudo ? 'yes' : 'no'],
+              ['JSON body limit',  security.runtime.jsonBodyLimit],
+              ['API key transport',security.runtime.apiKeyTransport],
+            ].map(([k,v])=>(
+              <div key={k} style={{display:'flex',gap:8,fontSize:12}}>
+                <span style={{color:'var(--text3)',minWidth:130}}>{k}</span>
+                <span style={{fontFamily:'var(--mono)',color:'var(--text)'}}>{v}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <SectionHeader icon={ShieldCheck} title="Enforced by this backend"/>
         <div style={{padding:'12px 16px',display:'flex',flexDirection:'column',gap:4}}>
-          {checks.map((c,i)=>(
+          {(security?.builtIn || []).map((text,i)=>(
             <div key={i} style={{display:'flex',alignItems:'center',gap:10,padding:'7px 0',borderBottom:'0.5px solid var(--border)',fontSize:12}}>
-              <span style={{color:c.ok?'var(--green)':'var(--amber)',fontSize:12,flexShrink:0,fontWeight:'bold'}}>{c.ok?'[✓]':'[!]'}</span>
-              <span style={{color:c.ok?'var(--text)':'var(--amber)'}}>{c.text}</span>
+              <span style={{color:'var(--green)',fontSize:12,flexShrink:0,fontWeight:'bold'}}>[✓]</span>
+              <span style={{color:'var(--text)'}}>{text}</span>
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      <Card>
+        <SectionHeader icon={AlertTriangle} title="Operator must verify" right={<Badge color="amber">not auto-checked</Badge>}/>
+        <div style={{padding:'12px 16px',display:'flex',flexDirection:'column',gap:4}}>
+          {(security?.operatorMustVerify || []).map((text,i)=>(
+            <div key={i} style={{display:'flex',alignItems:'center',gap:10,padding:'7px 0',borderBottom:'0.5px solid var(--border)',fontSize:12}}>
+              <span style={{color:'var(--amber)',fontSize:12,flexShrink:0,fontWeight:'bold'}}>[!]</span>
+              <span style={{color:'var(--amber)'}}>{text}</span>
             </div>
           ))}
         </div>
@@ -657,6 +764,8 @@ export default function App() {
   const [error,       setError]       = useState(null)
   const [wsState,     setWsState]     = useState('connecting')
   const [inspectedIP, setInspectedIP] = useState(null)   // ← modal state
+  const [theme, toggleTheme] = useTheme()
+  const [authInfo, setAuthInfo] = useState(null)
   const wsRef = useRef(null)
 
   const fetchJails = useCallback(async () => {
@@ -669,23 +778,45 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    fetchJails()
-    try {
-      const ws = createWebSocket(
-        msg => {
-          if (msg.type==='status') {
-            if (msg.data.daemon!==undefined) setDaemonOk(msg.data.daemon.ok)
-            if (msg.data.jails?.length)      setJails(msg.data.jails)
-            setLoading(false)
-          }
-        },
-        () => setWsState('error')
-      )
-      ws.onopen  = () => setWsState('connected')
-      ws.onclose = () => setWsState('disconnected')
-      wsRef.current = ws
-    } catch {}
-    return () => wsRef.current?.close()
+    let cancelled = false
+    ;(async () => {
+      try {
+        const me = await api.me()
+        if (cancelled) return
+        setAuthMode(me.mode)
+        setAuthInfo(me)
+        if (me.mode === 'oidc' && !me.authenticated) {
+          window.location.href = me.loginUrl
+          return
+        }
+      } catch (e) {
+        // /api/auth/me is unauthenticated; if it fails the backend is down.
+        setError(e.message)
+        return
+      }
+
+      await fetchJails()
+
+      try {
+        const ws = await createWebSocket(
+          msg => {
+            if (msg.type==='status') {
+              if (msg.data.daemon!==undefined) setDaemonOk(msg.data.daemon.ok)
+              if (msg.data.jails?.length)      setJails(msg.data.jails)
+              setLoading(false)
+            }
+          },
+          () => setWsState('error')
+        )
+        ws.onopen  = () => setWsState('connected')
+        ws.onclose = () => setWsState('disconnected')
+        wsRef.current = ws
+      } catch (e) {
+        setWsState('error')
+        console.error('[WS] connect failed:', e.message)
+      }
+    })()
+    return () => { cancelled = true; wsRef.current?.close() }
   }, [fetchJails])
 
   const totalBanned = jails.reduce((s,j)=>s+j.currentlyBanned,0)
@@ -701,14 +832,24 @@ export default function App() {
       {/* Sidebar */}
       <aside style={{width:210,background:'var(--bg2)',borderRight:'0.5px solid var(--border)',display:'flex',flexDirection:'column',flexShrink:0}}>
         <div style={{padding:'16px 16px 12px',borderBottom:'0.5px solid var(--border)'}}>
-          <div style={{display:'flex',alignItems:'center',gap:10}}>
-            <div style={{width:30,height:30,borderRadius:7,background:'var(--accent)',display:'flex',alignItems:'center',justifyContent:'center'}}>
-              <ShieldCheck size={16} color="#fff"/>
+          <div style={{display:'flex',alignItems:'center',gap:10,justifyContent:'space-between'}}>
+            <div style={{display:'flex',alignItems:'center',gap:10}}>
+              <div style={{width:30,height:30,borderRadius:7,background:'var(--accent)',display:'flex',alignItems:'center',justifyContent:'center'}}>
+                <ShieldCheck size={16} color="#fff"/>
+              </div>
+              <div>
+                <div style={{fontSize:13,fontWeight:700}}>Fail2Ban</div>
+                <div style={{fontSize:10,color:'var(--text3)'}}>Security Dashboard</div>
+              </div>
             </div>
-            <div>
-              <div style={{fontSize:13,fontWeight:700}}>Fail2Ban</div>
-              <div style={{fontSize:10,color:'var(--text3)'}}>Security Dashboard</div>
-            </div>
+            <button
+              onClick={toggleTheme}
+              aria-label={theme==='dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+              title={theme==='dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+              style={{background:'var(--bg3)',border:'0.5px solid var(--border)',borderRadius:'var(--radius)',color:'var(--text2)',cursor:'pointer',padding:6,display:'flex',alignItems:'center',justifyContent:'center'}}
+            >
+              {theme==='dark' ? <Sun size={13}/> : <Moon size={13}/>}
+            </button>
           </div>
         </div>
 
@@ -732,6 +873,22 @@ export default function App() {
             {wsState==='connected'?<Wifi size={10} style={{color:'var(--green)'}}/>:<WifiOff size={10} style={{color:'var(--text3)'}}/>}
             <span style={{color:'var(--text3)'}}>ws {wsState}</span>
           </div>
+          {authInfo?.mode==='oidc' && authInfo.user && (
+            <div style={{marginTop:8,paddingTop:8,borderTop:'0.5px solid var(--border)',display:'flex',alignItems:'center',gap:6}}>
+              <User size={11} style={{color:'var(--text2)',flexShrink:0}}/>
+              <span title={authInfo.user.email||authInfo.user.sub} style={{color:'var(--text2)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1}}>
+                {authInfo.user.name||authInfo.user.email||authInfo.user.sub}
+              </span>
+              <a href={authInfo.logoutUrl||'/logout'} title="Sign out" style={{color:'var(--text3)',display:'flex'}}>
+                <LogOut size={11}/>
+              </a>
+            </div>
+          )}
+          {authInfo?.mode==='oidc' && authInfo?.requiredGroup && authInfo.user && authInfo.user.inGroup===false && (
+            <div style={{marginTop:6,padding:'4px 6px',background:'rgba(246,173,85,0.12)',border:'0.5px solid rgba(246,173,85,0.3)',borderRadius:4,color:'var(--amber)',fontSize:10}}>
+              Read-only — missing group "{authInfo.requiredGroup}"
+            </div>
+          )}
         </div>
       </aside>
 

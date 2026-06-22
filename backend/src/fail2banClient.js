@@ -14,11 +14,27 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
-const LOG_PATH     = process.env.FAIL2BAN_LOG  || '/var/log/fail2ban.log';
+const LOG_PATH      = process.env.FAIL2BAN_LOG   || '/var/log/fail2ban.log';
 const LOG_MAX_LINES = parseInt(process.env.LOG_MAX_LINES || '500', 10);
+// Read at most this many bytes from the end of a log file. Defends against
+// pathologically large logs starving the process — fail2ban.log grows fast on
+// noisy boxes. 2 MB is ~10k average lines, well above LOG_MAX_LINES.
+const LOG_MAX_BYTES  = parseInt(process.env.LOG_MAX_BYTES  || String(2 * 1024 * 1024), 10);
+const AUTH_MAX_BYTES = parseInt(process.env.AUTH_MAX_BYTES || String(5 * 1024 * 1024), 10);
 // Use sudo so the process doesn't need to run as root.
 // The sudoers rule in docs/SECURITY.md scopes this to fail2ban-client only.
 const USE_SUDO = process.env.USE_SUDO !== 'false';
+
+// Return a readline interface over the LAST `maxBytes` of `filePath`. If the
+// file is bigger than maxBytes the very first emitted line is the tail end
+// of a line we sliced through — the caller should drop it.
+function tailReader(filePath, maxBytes) {
+  const stat = fs.statSync(filePath);
+  const start = Math.max(0, stat.size - maxBytes);
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8', start });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  return { rl, sliced: start > 0 };
+}
 
 // ─── Strict IP/CIDR validator ──────────────────────────────────────────────
 const IPV4_RE = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
@@ -160,12 +176,11 @@ async function getLogs(filterText = '', level = '') {
     }
 
     const lines = [];
-    const rl = readline.createInterface({
-      input: fs.createReadStream(LOG_PATH, { encoding: 'utf8' }),
-      crlfDelay: Infinity,
-    });
+    const { rl, sliced } = tailReader(LOG_PATH, LOG_MAX_BYTES);
+    let dropFirst = sliced;
 
     rl.on('line', (line) => {
+      if (dropFirst) { dropFirst = false; return; }
       if (!line.trim()) return;
 
       const lower = line.toLowerCase();
@@ -242,12 +257,11 @@ async function getReports() {
     // 2025-05-12 09:14:22,123 fail2ban.actions [1234]: NOTICE  [sshd] Ban 185.220.101.45
     const BAN_RE = /^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2},\d+\s+\S+\s+\[\d+\]:\s+\w+\s+\[([^\]]+)\] Ban ([\d.:a-fA-F]+)/;
 
-    const rl = readline.createInterface({
-      input: fs.createReadStream(LOG_PATH, { encoding: 'utf8' }),
-      crlfDelay: Infinity,
-    });
+    const { rl, sliced } = tailReader(LOG_PATH, LOG_MAX_BYTES);
+    let dropFirst = sliced;
 
     rl.on('line', (line) => {
+      if (dropFirst) { dropFirst = false; return; }
       const m = line.match(BAN_RE);
       if (!m) return;
 
@@ -331,12 +345,11 @@ async function getIPDetails(ip) {
     const isFail2ban = logPath === LOG_PATH;
 
     await new Promise((resolve) => {
-      const rl = readline.createInterface({
-        input: fs.createReadStream(logPath, { encoding: 'utf8' }),
-        crlfDelay: Infinity,
-      });
+      const { rl, sliced } = tailReader(logPath, isFail2ban ? LOG_MAX_BYTES : AUTH_MAX_BYTES);
+      let dropFirst = sliced;
 
       rl.on('line', (line) => {
+        if (dropFirst) { dropFirst = false; return; }
         if (!line.includes(ip)) return;  // fast pre-filter
 
         // Extract timestamp

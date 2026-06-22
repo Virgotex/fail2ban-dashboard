@@ -48,7 +48,7 @@ cd frontend && npm run dev
 # 5. Open http://localhost:5173
 ```
 
-> **First run:** The dashboard starts in demo mode with mock data if fail2ban isn't running. Once the daemon is up, refresh and it connects automatically.
+> **First run:** If the fail2ban daemon isn't running or your user can't reach it, the dashboard renders empty jail lists and the sidebar marks the daemon offline. Start fail2ban (`sudo systemctl start fail2ban`) and refresh — it will connect automatically.
 
 ---
 
@@ -112,21 +112,53 @@ fail2ban-dashboard/
 |---|---|
 | Secure HTTP headers | Helmet (XSS, HSTS, no-sniff, CSP) |
 | CORS | Restricted to `localhost:5173` only |
-| Rate limiting | 100 req/min global · 20 req/min for writes |
+| Rate limiting | 100 req/min global · 20 req/min for writes (honours `trust proxy`) |
 | Input validation | All parameters validated before use |
 | No shell injection | Commands built as arg arrays — never string-interpolated |
 | IP validation | Strict IPv4/IPv6/CIDR regex before any ban/unban |
-| API key auth | Constant-time comparison to prevent timing attacks |
-| WebSocket auth | Origin check + API key required on every upgrade |
+| API key transport | `X-API-Key` header for HTTP; `Sec-WebSocket-Protocol` for WS — never in URLs or access logs |
+| Constant-time key check | `crypto.timingSafeEqual` to prevent timing attacks |
+| WebSocket auth | Origin check + API key on every upgrade |
 | Payload size limit | JSON body capped at 10KB |
+| Log reads bounded | Only the last few MB of `fail2ban.log` and friends are read per request |
+| Geo lookups proxied | IP intel goes through the backend (cached) so investigated IPs don't leak to a third party from your browser |
+
+> **Auth scope:** The `VITE_API_KEY` ships inside the React bundle — anyone who can load the dashboard URL holds the key. It exists to gate non-browser callers, not to authenticate end users. For multi-user / LAN access add OIDC or a session+password layer in front (see `docs/SECURITY.md`).
 
 ### What you should add for LAN/production use
 
-1. **Put it behind a reverse proxy with HTTPS** (Nginx or Caddy)
-2. **Add OIDC authentication** (Keycloak, Authentik, or Pocket-ID)
-3. **Firewall port 3001** — it must NEVER be reachable from outside `127.0.0.1`
+1. **Put it behind a reverse proxy with HTTPS** (Nginx or Caddy).
+2. **Switch to OIDC** by setting `OIDC_ENABLED=true` and the matching env vars (see `backend/.env.example`). Works with Keycloak, Authentik, Okta, Azure AD, Auth0 — anything OIDC-compliant. Set `OIDC_REQUIRED_GROUP` to limit ban/unban to a specific group/role.
+3. **Restrict reachability** — host firewall on the dashboard's port (or a private subnet / NetworkPolicy in k8s); only the reverse proxy should be able to reach it.
 
-See `docs/SECURITY.md` for detailed hardening steps.
+See `docs/SECURITY.md` for the detailed OIDC walkthrough and example reverse-proxy configs.
+
+---
+
+## Production deployment
+
+```bash
+# 1. Build the SPA
+cd frontend && npm run build
+
+# 2. Configure the backend
+cd ../backend && cp .env.example .env
+# Fill in OIDC_* settings, set BIND_ADDRESS, NODE_ENV=production, etc.
+
+# 3. Start it
+NODE_ENV=production node src/server.js
+```
+
+When `frontend/dist/index.html` exists, the backend serves the SPA from the same origin — one process, one port, one auth boundary. The startup banner confirms it:
+
+```
+🛡  Fail2Ban Dashboard API
+   Listening on http://0.0.0.0:3001
+   Auth mode:    OIDC (writes require "fail2ban-admins")
+   SPA serving:  on (/srv/fail2ban-dashboard/frontend/dist)
+```
+
+Every ban/unban emits a structured audit line (`[AUDIT] {"ts":…,"user":"<oidc-sub>","action":"ban",…}`) — pipe stdout to journald or your log aggregator.
 
 ---
 

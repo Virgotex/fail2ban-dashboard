@@ -1,24 +1,55 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* ─── Theme variables ───────────────────────────────────────────────────
+   Brand accent colors are shared between themes — they read well on both
+   backgrounds. Only the bg/text/border tokens differ. Theme is selected by
+   a data-theme attribute on <html>; the inline script in index.html sets it
+   before React mounts to avoid a flash of wrong theme.
+   ─────────────────────────────────────────────────────────────────────── */
 :root {
-  --bg:        #0a0c0f;
-  --bg2:       #0f1318;
-  --bg3:       #141920;
-  --border:    rgba(255,255,255,0.07);
-  --border2:   rgba(255,255,255,0.13);
-  --text:      #e2e8f0;
-  --text2:     #7d8fa3;
-  --text3:     #4a5568;
-  --accent:    #e24b4a;
-  --accent2:   #ff6b6b;
-  --green:     #48bb78;
-  --amber:     #f6ad55;
-  --blue:      #63b3ed;
-  --purple:    #9f7aea;
-  --mono:      'JetBrains Mono', monospace;
-  --sans:      'Syne', sans-serif;
-  --radius:    6px;
-  --radius-lg: 10px;
+  --accent:     #e24b4a;
+  --accent2:    #ff6b6b;
+  --green:      #48bb78;
+  --amber:      #f6ad55;
+  --blue:       #63b3ed;
+  --blue-hover: #90cdf4;
+  --purple:     #9f7aea;
+  --mono:       'JetBrains Mono', monospace;
+  --sans:       'Syne', sans-serif;
+  --radius:     6px;
+  --radius-lg:  10px;
+}
+
+/* Default = dark (also applied when no data-theme attribute is set) */
+:root,
+:root[data-theme='dark'] {
+  --bg:         #0a0c0f;
+  --bg2:        #0f1318;
+  --bg3:        #141920;
+  --border:     rgba(255,255,255,0.07);
+  --border2:    rgba(255,255,255,0.13);
+  --text:       #e2e8f0;
+  --text2:      #7d8fa3;
+  --text3:      #4a5568;
+  --hover-tint: rgba(255,255,255,0.04);
+  --shadow:     0 24px 64px rgba(0,0,0,0.6);
+  --scrollbar-track: var(--bg);
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  --bg:         #f6f8fb;
+  --bg2:        #ffffff;
+  --bg3:        #f1f4f8;
+  --border:     rgba(15,23,42,0.08);
+  --border2:    rgba(15,23,42,0.16);
+  --text:       #1a202c;
+  --text2:      #4a5568;
+  --text3:      #718096;
+  --hover-tint: rgba(15,23,42,0.04);
+  --shadow:     0 24px 64px rgba(15,23,42,0.18);
+  --scrollbar-track: var(--bg2);
+  color-scheme: light;
 }
 
 html, body, #root {
@@ -29,11 +60,12 @@ html, body, #root {
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  transition: background-color .2s ease, color .2s ease;
 }
 
 /* Scrollbar */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
-::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-track { background: var(--scrollbar-track); }
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text3); }
 
