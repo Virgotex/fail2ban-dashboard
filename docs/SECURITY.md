@@ -111,6 +111,19 @@ Cmnd_Alias FAIL2BAN_CMDS = /usr/bin/fail2ban-client status, \
 youruser ALL=(root) NOPASSWD: FAIL2BAN_CMDS
 ```
 
+> ⚠️ **Modern sudo (Ubuntu 22.04+/sudo ≥ 1.9.10) rejects wildcards that aren't at
+> the end of a command**, so the `set * banip *` / `set * unbanip *` lines above
+> fail `visudo -c` with `wildcards are not allowed in command arguments`. If you
+> hit that, use the binary-scoped rule instead — it always validates:
+>
+> ```sudoers
+> youruser ALL=(root) NOPASSWD: /usr/bin/fail2ban-client
+> ```
+>
+> This permits any `fail2ban-client` subcommand as root. On a single-user box
+> that's an acceptable trade-off — the dashboard still validates every IP/jail and
+> builds fixed argument arrays, so no untrusted input reaches the command.
+
 ## 6. Log access
 
 Make sure your user can read the fail2ban log:

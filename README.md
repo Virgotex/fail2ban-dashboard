@@ -4,6 +4,11 @@ A lightweight, security-hardened web dashboard for monitoring and managing Fail2
 
 **Stack:** React + Vite (frontend) · Express.js (backend API) · WebSocket (real-time updates)
 
+> **Deploying to a server?** For a hardened, tunnel-only server install (bind to
+> loopback, run as a `systemd` service, reach it over SSH — nothing exposed to the
+> network), follow **[`DEPLOY.md`](DEPLOY.md)**. It's a start-to-finish, verified
+> walkthrough. The Quick Start below is for local development.
+
 ---
 
 ## Features
@@ -137,15 +142,19 @@ See `docs/SECURITY.md` for the detailed OIDC walkthrough and example reverse-pro
 
 ## Production deployment
 
+For a full, verified server walkthrough — host hardening, fail2ban setup,
+least-privilege sudo, `systemd` service, and SSH-tunnel access — follow
+**[`DEPLOY.md`](DEPLOY.md)**. The short version:
+
 ```bash
 # 1. Build the SPA
 cd frontend && npm run build
 
 # 2. Configure the backend
 cd ../backend && cp .env.example .env
-# Fill in OIDC_* settings, set BIND_ADDRESS, NODE_ENV=production, etc.
+# Set NODE_ENV=production, BIND_ADDRESS=127.0.0.1, and (for LAN/public) OIDC_*.
 
-# 3. Start it
+# 3. Start it (or better, run it as a systemd service — see DEPLOY.md Part 6)
 NODE_ENV=production node src/server.js
 ```
 
