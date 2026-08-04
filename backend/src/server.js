@@ -278,6 +278,9 @@ app.get('/api/security', requireRead, (req, res) => {
       authMode:           OIDC_ENABLED ? 'oidc' : 'apikey',
       requiredGroup:      OIDC_ENABLED ? (OIDC_REQUIRED_GROUP || 'none') : null,
       servesStaticSPA:    SERVE_STATIC,
+      apiKeyTransport:    OIDC_ENABLED
+        ? 'session cookie (HTTP) · one-shot ticket (WS)'
+        : 'X-API-Key header (HTTP) · Sec-WebSocket-Protocol (WS)',
     },
     builtIn: [
       `Backend binds to ${BIND_ADDRESS}`,

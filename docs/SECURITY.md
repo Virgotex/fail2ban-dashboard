@@ -22,12 +22,19 @@ sudo apt install caddy
 `/etc/caddy/Caddyfile`:
 ```
 fail2ban.local {
-    reverse_proxy localhost:5173
+    # In production the backend serves the built SPA *and* the API on :3001.
+    # Proxy to the backend — NOT the Vite dev server (:5173), which only runs
+    # during development.
+    reverse_proxy localhost:3001
     tls internal
 }
 ```
 
 Then access via `https://fail2ban.local` (add to `/etc/hosts` if needed).
+
+> If you set `TRUST_PROXY=1` (or the proxy's IP) in `backend/.env` so rate
+> limiting and audit logs see the real client IP, Caddy is a non-loopback
+> proxy from the backend's point of view.
 
 ## 3. Enable OIDC authentication (built-in)
 

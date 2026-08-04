@@ -62,7 +62,9 @@ function runCommand(args) {
   const bin  = USE_SUDO ? 'sudo' : 'fail2ban-client';
   const argv = USE_SUDO ? ['fail2ban-client', ...args] : args;
   return new Promise((resolve, reject) => {
-    execFile(bin, argv, { timeout: 10000 }, (err, stdout, stderr) => {
+    // maxBuffer guards against a jail with thousands of banned IPs overflowing
+    // the default 1 MB stdout cap on `status <jail>`.
+    execFile(bin, argv, { timeout: 10000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         reject(new Error(stderr || err.message));
         return;
@@ -275,10 +277,10 @@ async function getReports() {
         dailyMap[dateStr]++;
       }
 
-      // Recent bans list (newest first, cap at 50)
-      if (recentBans.length < 50) {
-        recentBans.push({ date: dateStr, jail, ip });
-      }
+      // Collect every ban in the window; we slice the newest 50 at the end.
+      // (Capping here would keep the *oldest* 50 in the tail window, not the
+      // most recent — the opposite of what "recent bans" should show.)
+      recentBans.push({ date: dateStr, jail, ip });
     });
 
     rl.on('close', () => {
@@ -293,7 +295,8 @@ async function getReports() {
         .map(([name, bans]) => ({ name, bans }))
         .sort((a, b) => b.bans - a.bans);
 
-      resolve({ dailyBans, byJail, recentBans: recentBans.reverse() });
+      // Newest 50, most-recent first.
+      resolve({ dailyBans, byJail, recentBans: recentBans.slice(-50).reverse() });
     });
 
     rl.on('error', reject);
