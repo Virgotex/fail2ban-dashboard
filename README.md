@@ -254,20 +254,65 @@ cd frontend && npm run build
 
 ---
 
-## Hosting on GitHub
+## Hosting this on GitHub
+
+The code is safe to publish. **Your configuration is not** — the split is by
+design, so hosting the repo (public or private) needs no special handling beyond
+leaving it in place.
+
+### What never goes to git
+
+| File | Why | Where it lives instead |
+|---|---|---|
+| `hub/servers.json` | Every agent's API key **plus your real hostnames/IPs** | only on the machine running the hub |
+| `hub/.env` | `HUB_API_SECRET` | only on the hub machine |
+| `backend/.env` | that server's `API_SECRET` | only on that server |
+| `frontend/.env.local` | a copy of the hub secret | only on the hub machine |
+| `frontend/dist/` | the built bundle, with `HUB_API_SECRET` baked in | rebuilt on the hub |
+
+Committed instead: `servers.example.json` and the `.env.example` files, with
+placeholders. Everything real is generated per install by `setup.sh`.
+
+### Two locks
+
+1. **`.gitignore`** covers all of the above — including `**/servers.json` at any
+   depth and the `dist/` bundle.
+2. **A pre-commit hook** inspects what's actually staged, because `.gitignore`
+   can't stop `git add -f`, a rename, or a key pasted into a doc. Enable it once
+   per clone (`setup.sh` does it for you):
+
+   ```bash
+   git config core.hooksPath .githooks
+   ```
+
+   It blocks: any file named `servers.json` / `.env` / `.env.local`, private key
+   material, `frontend/dist/*`, and any staged diff containing a 32+ character
+   hex string (the shape of every key this project generates) or a real-looking
+   `"apiKey"` value.
+
+### Verify before you push
 
 ```bash
-git init
-git add .
-git commit -m "Initial commit: fail2ban dashboard"
-gh repo create fail2ban-dashboard --public --source=. --push
+git ls-files | grep -Ei 'servers\.json|\.env$|\.env\.local'      # expect: nothing
+git grep -nE '[0-9a-f]{32,}' -- . ':!*package-lock.json'         # expect: nothing
 ```
 
-`.gitignore` already excludes `.env`, `.env.local`, `node_modules`, and
-`hub/servers.json`.
+### If a secret does get pushed
 
-> **Important:** `.env` files hold your secrets and `hub/servers.json` holds
-> *every agent's* secret. They are gitignored. Never commit them.
+Deleting the file in a later commit is **not** enough — it stays in history and
+in forks. Rotate the credential instead: generate a new key, update
+`backend/.env` on that agent and `servers.json` on the hub, restart both. The
+exposed key was only ever usable by someone who could already SSH to that host
+(agents are loopback-only), so rotation plus checking that host's `auth.log` is
+the proportionate response. See [`docs/SECURITY.md`](docs/SECURITY.md) §2.
+
+### Public or private?
+
+Either works. Public is fine — there are no credentials, no hostnames, and no
+information about your fleet in the tree. Private adds a little obscurity about
+which tooling you run, at the cost of `git clone` on each server needing a
+deploy key or token. If you go private, a read-only deploy key per server is the
+tidy option.
 
 ---
 

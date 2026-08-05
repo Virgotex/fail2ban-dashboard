@@ -47,7 +47,7 @@ reference for how the hub behaves.
 ```json
 [
   { "id": "web-01", "name": "Web 01", "baseUrl": "http://127.0.0.1:4101",
-    "apiKey": "<that agent's API_SECRET>", "ssh": "carlton@web-01" }
+    "apiKey": "<that agent's API_SECRET>", "ssh": "deploy@web-01" }
 ]
 ```
 
@@ -78,7 +78,7 @@ from **"agent down"** (`tunnel` and `tunnelError` appear per server in
 
 ```
 [tunnel] managing 2 tunnel(s) with ssh
-[tunnel] web-01 up — 127.0.0.1:4101 → carlton@web-01:127.0.0.1:3001
+[tunnel] web-01 up — 127.0.0.1:4101 → deploy@web-01:127.0.0.1:3001
 [tunnel] web-01 exited (code 255), reconnecting in 2s
 ```
 

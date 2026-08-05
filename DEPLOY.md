@@ -41,6 +41,50 @@ identical either way.
 
 ---
 
+## Runbook — the order to do things in
+
+The detail is in Parts A and B; this is the sequence, so you always know what's
+next. Roughly 20 minutes for the first server, ~5 for each one after.
+
+| # | Where | Do this | You're done when |
+|---|---|---|---|
+| 1 | GitHub | Host the repo; confirm no config went with it (*Secrets and hosting* below) | `git ls-files` shows no `servers.json` or `.env` |
+| 2 | First monitored server | Part A — pre-flight, install agent, sudo rule, systemd unit | `/api/health` returns `role":"agent"` and `/api/status` returns `ok":true` |
+| 3 | — | **Copy that server's `API_SECRET`** (`grep '^API_SECRET' backend/.env`) | you have it pasted somewhere safe |
+| 4 | Hub machine (your laptop or a server) | Part B — `setup.sh hub --local` (or `hub`) | `HUB_API_SECRET` generated, UI built |
+| 5 | Hub machine | Add server #1 to `hub/servers.json`: id, name, free local port, its `API_SECRET`, `ssh` target | `chmod 600 hub/servers.json` done |
+| 6 | Hub machine | `ssh -o BatchMode=yes user@server true` | prints nothing / no password prompt |
+| 7 | Hub machine | `cd hub && npm start` | `[tunnel] … up`, and **http://localhost:3100** shows one green row |
+| 8 | Each further server | Repeat 2–3, then add an entry on the next free port and restart the hub | new row appears in the fleet overview |
+
+Two things people trip on, both covered below: the agent's `API_SECRET` in
+`servers.json` must match that server's `backend/.env` exactly, and the hub
+machine must reach each server over SSH **without a password**.
+
+### Upgrading a server that ran the older single-service build
+
+If a box already runs the pre-split dashboard (one service serving both the API
+and the UI), it becomes an agent in place — its `API_SECRET`, sudoers rule and
+`adm` membership all carry over:
+
+```bash
+cd /opt/fail2ban-dashboard
+git fetch origin && git checkout feat/multi-server-hub && git pull
+cd backend && npm install --omit=dev && cd ..     # prunes ws / cors / oidc
+sudo systemctl restart fail2ban-dashboard          # the existing unit runs the agent as-is
+
+curl -s http://127.0.0.1:3001/api/health; echo     # → role":"agent"
+grep '^API_SECRET' backend/.env                    # ← the hub needs this
+rm -rf frontend/dist                               # optional: no longer served here
+```
+
+Keeping the old unit name is fine — it already runs `node src/server.js` from
+`backend/`, which *is* the agent. **That box stops serving a UI** at this point:
+`http://localhost:3001` will return `{"error":"Not found"}`, and the dashboard
+comes from the hub instead.
+
+---
+
 ## Step 0 — Key-based SSH is a prerequisite
 
 The hub reaches every agent over an SSH tunnel, so **the hub host's user must be
@@ -412,8 +456,8 @@ That generates your own `HUB_API_SECRET`, builds the UI, and sets
 **2. Confirm passwordless SSH to each server** — this is what the tunnels use:
 
 ```bash
-ssh -o BatchMode=yes carlton@your-server true && echo "key auth OK"
-# if it fails:  ssh-copy-id carlton@your-server
+ssh -o BatchMode=yes deploy@your-server true && echo "key auth OK"
+# if it fails:  ssh-copy-id deploy@your-server
 ```
 
 **3. Register your servers** in `hub/servers.json` — same fields as B2 below.
@@ -422,7 +466,7 @@ ssh -o BatchMode=yes carlton@your-server true && echo "key auth OK"
 ```json
 [
   { "id": "test-01", "name": "Test 01", "baseUrl": "http://127.0.0.1:4101",
-    "apiKey": "<that agent's API_SECRET>", "ssh": "carlton@test-01" }
+    "apiKey": "<that agent's API_SECRET>", "ssh": "deploy@test-01" }
 ]
 ```
 
@@ -437,7 +481,7 @@ You'll see a tunnel line per server, then the dashboard is at
 
 ```
 [tunnel] managing 2 tunnel(s) with ssh
-[tunnel] test-01 up — 127.0.0.1:4101 → carlton@test-01:127.0.0.1:3001
+[tunnel] test-01 up — 127.0.0.1:4101 → deploy@test-01:127.0.0.1:3001
 ```
 
 Tunnels reconnect on their own with exponential backoff (a server down for an
@@ -493,9 +537,9 @@ Edit `hub/servers.json` — one entry per agent:
 ```json
 [
   { "id": "web-01", "name": "Web 01", "baseUrl": "http://127.0.0.1:4101",
-    "apiKey": "<web-01's API_SECRET>", "ssh": "carlton@web-01.example.com" },
+    "apiKey": "<web-01's API_SECRET>", "ssh": "deploy@web-01.example.com" },
   { "id": "web-02", "name": "Web 02", "baseUrl": "http://127.0.0.1:4102",
-    "apiKey": "<web-02's API_SECRET>", "ssh": "carlton@web-02.example.com" }
+    "apiKey": "<web-02's API_SECRET>", "ssh": "deploy@web-02.example.com" }
 ]
 ```
 
@@ -614,7 +658,7 @@ curl -s http://127.0.0.1:3001/api/health                    # → role":"agent"
 **On the hub** — make sure the hub user can reach it, then register it:
 
 ```bash
-ssh -o BatchMode=yes carlton@new-server true && echo "key auth OK"   # else: ssh-copy-id
+ssh -o BatchMode=yes deploy@new-server true && echo "key auth OK"   # else: ssh-copy-id
 nano hub/servers.json          # add the entry with the next free local port (4104, 4105, …)
 sudo TUNNEL_USER=$USER bash hub/install-tunnels.sh
 sudo systemctl restart fail2ban-hub                                  # registry is read at startup
@@ -626,6 +670,46 @@ outward: tunnel (`--status`) → agent (`journalctl -u fail2ban-agent` on that
 host) → `apiKey` mismatch.
 
 To remove one again, see [A7](#a7--removing-an-agent-rollback).
+
+---
+
+## Secrets and hosting
+
+The repo is safe to publish; your configuration is not. That split is
+deliberate, so hosting needs nothing special — just don't defeat it.
+
+**Never committed** (all gitignored): `hub/servers.json` (every agent's key *and*
+your real hostnames), `hub/.env`, `backend/.env`, `frontend/.env.local`, and
+`frontend/dist/` (the bundle carries `HUB_API_SECRET`). Committed instead:
+`servers.example.json` and the `.env.example` files, with placeholders.
+
+**Enable the pre-commit hook once per clone** — `.gitignore` can't stop
+`git add -f`, a rename, or a key pasted into a doc:
+
+```bash
+git config core.hooksPath .githooks      # setup.sh does this for you
+```
+
+It refuses any commit that stages a `servers.json` / `.env`, private key
+material, `frontend/dist/*`, or a diff containing a 32+ character hex string.
+
+**Check before pushing:**
+
+```bash
+git ls-files | grep -Ei 'servers\.json|\.env$|\.env\.local'    # expect nothing
+git grep -nE '[0-9a-f]{32,}' -- . ':!*package-lock.json'       # expect nothing
+```
+
+**If a key does reach a remote,** rotate it rather than rewriting history —
+history lives on in clones and forks. Generate a new value, update that agent's
+`backend/.env` and the hub's `servers.json`, restart both. Because agents are
+loopback-only, the leaked key was only usable by someone who could already SSH to
+that host; rotating and reviewing that host's `auth.log` is the proportionate
+response. Full procedure: [`docs/SECURITY.md`](docs/SECURITY.md) §2.
+
+**Deploying from a private repo:** each server's `git clone` needs credentials.
+A read-only deploy key per server is tidiest; a fine-grained PAT also works.
+Nothing in the dashboard depends on the repo being reachable after install.
 
 ---
 

@@ -1,12 +1,30 @@
 node_modules/
 dist/
-.env
-.env.local
-.env.*.local
 *.log
 .DS_Store
 .vscode/
 .idea/
 
-# Hub server registry — contains each agent's API secret. Never commit.
-hub/servers.json
+# ─── Secrets — never commit ──────────────────────────────────────────────
+# Anything below either IS a credential or contains one.
+
+# API secrets: API_SECRET (agents), HUB_API_SECRET (hub)
+.env
+.env.local
+.env.*.local
+
+# The server registry: real hostnames/IPs + EVERY agent's API key.
+# Matched at any depth in case the hub is copied elsewhere.
+servers.json
+**/servers.json
+!hub/servers.example.json
+
+# Private key material, if anyone ever parks a deploy key in the tree
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Built SPA — the bundle has HUB_API_SECRET baked into it at build time
+frontend/dist/

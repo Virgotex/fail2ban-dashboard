@@ -11,12 +11,12 @@
 #
 # Usage (on the hub host):
 #   sudo bash install-tunnels.sh                 # install/refresh every tunnel
-#   sudo TUNNEL_USER=carlton bash install-tunnels.sh
+#   sudo TUNNEL_USER=deploy bash install-tunnels.sh
 #   sudo bash install-tunnels.sh --status        # just show current state
 #   sudo bash install-tunnels.sh --remove        # tear everything down
 #
 # servers.json entries need an "ssh" field for this script:
-#   { "id":"web-01", "baseUrl":"http://127.0.0.1:4101", "ssh":"carlton@web-01" }
+#   { "id":"web-01", "baseUrl":"http://127.0.0.1:4101", "ssh":"deploy@web-01" }
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

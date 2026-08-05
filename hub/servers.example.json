@@ -4,20 +4,20 @@
     "name": "Web server 01",
     "baseUrl": "http://127.0.0.1:4101",
     "apiKey": "PASTE_web-01_API_SECRET_HERE",
-    "ssh": "carlton@web-01.example.com"
+    "ssh": "deploy@web-01.example.com"
   },
   {
     "id": "web-02",
     "name": "Web server 02",
     "baseUrl": "http://127.0.0.1:4102",
     "apiKey": "PASTE_web-02_API_SECRET_HERE",
-    "ssh": "carlton@web-02.example.com"
+    "ssh": "deploy@web-02.example.com"
   },
   {
     "id": "db-01",
     "name": "Database 01",
     "baseUrl": "http://127.0.0.1:4103",
     "apiKey": "PASTE_db-01_API_SECRET_HERE",
-    "ssh": "carlton@db-01.example.com"
+    "ssh": "deploy@db-01.example.com"
   }
 ]

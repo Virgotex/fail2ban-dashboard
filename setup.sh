@@ -43,6 +43,16 @@ echo -e "${GREEN}✓ Node.js $(node -v)${NC}"
 
 gen_secret() { node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"; }
 
+# Everything below generates real secrets into this working tree. Point git at
+# the repo's hooks so a stray `git add` can't publish them — .gitignore alone
+# doesn't survive `git add -f`, a rename, or a key pasted into a doc.
+if [ -d .git ] && [ -x .githooks/pre-commit ]; then
+  if [ "$(git config --get core.hooksPath 2>/dev/null)" != ".githooks" ]; then
+    git config core.hooksPath .githooks 2>/dev/null \
+      && echo -e "${GREEN}✓ Enabled the secret-blocking pre-commit hook${NC}"
+  fi
+fi
+
 # ─────────────────────────────────────────────────────────────────────────
 #  AGENT
 # ─────────────────────────────────────────────────────────────────────────
