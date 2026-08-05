@@ -264,6 +264,40 @@ Dashboard page.
 
 ---
 
+## Managing multiple servers
+
+This dashboard is **single-server by design**: each backend only talks to the
+fail2ban running on its *own* machine. There is **no central aggregation** — one
+dashboard instance shows one server's jails, bans, and logs. Instances know
+nothing about each other, so attacks on one server never appear in another's view.
+
+To monitor several servers, deploy the dashboard on each (repeat Parts 1–6 per
+host), then tunnel to each on a **different local port** — one browser tab per
+server:
+
+```bash
+# Server A → laptop port 3001
+ssh -L 3001:127.0.0.1:3001 youruser@SERVER_A_IP     # http://localhost:3001
+
+# Server B → laptop port 3002  (change the LEFT number per server)
+ssh -L 3002:127.0.0.1:3001 youruser@SERVER_B_IP     # http://localhost:3002
+
+# Server C → laptop port 3003
+ssh -L 3003:127.0.0.1:3001 youruser@SERVER_C_IP     # http://localhost:3003
+```
+
+The number on the **right** is always `3001` (the port the backend listens on
+*inside* each server). Only the number on the **left** — your laptop's local
+port — changes, so each tab maps to a distinct server.
+
+> **Want one combined view across all servers?** That's a real feature this
+> project doesn't have — it would require a central aggregator that each server
+> reports into (or that polls each server), plus auth spanning hosts. It's a
+> meaningful build, not a config flag. The per-server + per-port-tunnel approach
+> above is the simple, secure way to run it today.
+
+---
+
 ## Operations
 
 ```bash
