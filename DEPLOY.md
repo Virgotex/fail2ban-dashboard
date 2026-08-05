@@ -290,11 +290,17 @@ The number on the **right** is always `3001` (the port the backend listens on
 *inside* each server). Only the number on the **left** — your laptop's local
 port — changes, so each tab maps to a distinct server.
 
-> **Want one combined view across all servers?** That's a real feature this
-> project doesn't have — it would require a central aggregator that each server
-> reports into (or that polls each server), plus auth spanning hosts. It's a
-> meaningful build, not a config flag. The per-server + per-port-tunnel approach
-> above is the simple, secure way to run it today.
+### One combined view across all servers
+
+If you'd rather have a **single dashboard** with a fleet overview and a server
+picker — instead of one browser tab per server — deploy the **hub**. Each server
+stays a normal agent (this guide, Parts 1–6); the hub aggregates them and lets
+you drill into any one with the same per-server views. See
+**[`hub/README.md`](hub/README.md)** for the full setup.
+
+The hub is a *live* aggregator (no stored history), comfortable up to a few dozen
+servers. The per-server + per-port-tunnel approach above still works and needs no
+extra service — pick whichever fits.
 
 ---
 

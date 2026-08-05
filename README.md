@@ -20,6 +20,7 @@ A lightweight, security-hardened web dashboard for monitoring and managing Fail2
 - Security posture checklist
 - WebSocket live updates every 10 seconds
 - Secure by default (see Security section)
+- **Multi-server:** an optional [hub](hub/README.md) aggregates many servers into one dashboard with a fleet overview + per-server drill-down
 
 ---
 
