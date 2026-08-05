@@ -7,3 +7,6 @@ dist/
 .DS_Store
 .vscode/
 .idea/
+
+# Hub server registry — contains each agent's API secret. Never commit.
+hub/servers.json

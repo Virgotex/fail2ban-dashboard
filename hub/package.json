@@ -1,0 +1,20 @@
+{
+  "name": "fail2ban-dashboard-hub",
+  "version": "1.0.0",
+  "description": "Multi-server aggregator (hub) for the Fail2Ban Dashboard",
+  "main": "src/hub.js",
+  "scripts": {
+    "start": "node src/hub.js",
+    "dev": "nodemon src/hub.js"
+  },
+  "dependencies": {
+    "express": "^4.21.1",
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.1.5",
+    "morgan": "^1.10.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}

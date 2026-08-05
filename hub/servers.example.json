@@ -1,0 +1,20 @@
+[
+  {
+    "id": "web-01",
+    "name": "Web server 01",
+    "baseUrl": "http://127.0.0.1:4101",
+    "apiKey": "PASTE_web-01_API_SECRET_HERE"
+  },
+  {
+    "id": "web-02",
+    "name": "Web server 02",
+    "baseUrl": "http://127.0.0.1:4102",
+    "apiKey": "PASTE_web-02_API_SECRET_HERE"
+  },
+  {
+    "id": "db-01",
+    "name": "Database 01",
+    "baseUrl": "http://127.0.0.1:4103",
+    "apiKey": "PASTE_db-01_API_SECRET_HERE"
+  }
+]
