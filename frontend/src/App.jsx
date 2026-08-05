@@ -1,7 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts'
-import { ShieldCheck, ShieldOff, Activity, Lock, FileText, BarChart2, Settings, AlertTriangle, RefreshCw, Wifi, WifiOff, Trash2, Search, Terminal, Sun, Moon, LogOut, User, Server, Layers } from 'lucide-react'
-import { api, createWebSocket, setAuthMode, detectMode, setServer } from './hooks/useApi'
+import { ShieldCheck, ShieldOff, Activity, Lock, FileText, BarChart2, Settings, AlertTriangle, RefreshCw, Trash2, Search, Terminal, Sun, Moon, Server, Layers } from 'lucide-react'
+import { api, setServer } from './hooks/useApi'
+
+// How often the views refresh. There is no push channel by design: polling is
+// what lets the hub cache and coalesce, so the load a monitored server sees
+// stays flat no matter how many operators are watching. Both are deliberately
+// slower than a single-server dashboard would need.
+const FLEET_POLL_MS  = 20000
+const SERVER_POLL_MS = 15000
 
 // ─── Theme ───────────────────────────────────────────────────────────────
 // data-theme on <html> drives all CSS variables in index.css. The early
@@ -17,6 +24,33 @@ function useTheme() {
     try { localStorage.setItem(THEME_KEY, theme) } catch {}
   }, [theme])
   return [theme, () => setTheme(t => t === 'dark' ? 'light' : 'dark')]
+}
+
+// ─── Visibility-aware polling ────────────────────────────────────────────
+// Runs `fn` immediately, then every intervalMs — but only while the tab is
+// actually being looked at, and once more the moment it becomes visible
+// again. A forgotten background tab polling a fleet costs every monitored
+// server real work for nobody's benefit.
+function usePoll(fn, intervalMs, enabled = true) {
+  const saved = useRef(fn)
+  useEffect(() => { saved.current = fn })
+
+  useEffect(() => {
+    if (!enabled) return
+    let timer = null
+    const run   = () => { if (document.visibilityState === 'visible') saved.current() }
+    const start = () => { if (!timer) timer = setInterval(run, intervalMs) }
+    const stop  = () => { if (timer) { clearInterval(timer); timer = null } }
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') { saved.current(); start() }
+      else stop()
+    }
+
+    run()
+    start()
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => { stop(); document.removeEventListener('visibilitychange', onVisibilityChange) }
+  }, [intervalMs, enabled])
 }
 
 const PIE_COLORS = ['#e24b4a','#f6ad55','#63b3ed','#48bb78','#9f7aea','#fc8181','#76e4f7']
@@ -686,12 +720,13 @@ function SettingsPage() {
         {loadingSec ? <LoadingBox rows={4}/> : errorSec ? <ErrorBox message={errorSec} onRetry={fetchSecurity}/> : security && (
           <div style={{padding:'14px 16px',display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
             {[
+              ['Role',             security.runtime.role || 'agent'],
               ['Bind address',     security.runtime.bindAddress],
               ['Port',             String(security.runtime.port)],
-              ['Allowed origin',   security.runtime.allowedOrigin],
               ['NODE_ENV',         security.runtime.nodeEnv],
               ['Trust proxy',      String(security.runtime.trustProxy)],
               ['Rate limit',       `${security.runtime.rateLimit.max}/${security.runtime.rateLimit.windowMs/1000}s · writes ${security.runtime.rateLimit.writeMax}/min`],
+              ['Read cache',       `${security.runtime.cacheTtlMs}ms · logs ${security.runtime.logCacheTtlMs}ms`],
               ['Geo lookup',       security.runtime.geoLookupEnabled ? 'enabled (server-side proxy)' : 'disabled'],
               ['fail2ban via sudo',security.runtime.useSudo ? 'yes' : 'no'],
               ['JSON body limit',  security.runtime.jsonBodyLimit],
@@ -733,16 +768,21 @@ function SettingsPage() {
   )
 }
 
-// ─── Fleet Overview (hub mode) ────────────────────────────────────────────
-// One row per server, fanned out by the hub. Clicking a server jumps into its
-// per-server dashboard — the same views you get in single-server mode.
+// "unreachable" is the honest-but-useless answer. When the hub manages the
+// tunnel it knows which half is broken, so say so — the fix is different.
+function statusLabel(s) {
+  if (!s.tunnel) return 'unreachable'
+  if (s.tunnel === 'up')       return 'agent down'      // tunnel fine, nothing listening
+  if (s.tunnel === 'starting') return 'connecting…'
+  return 'tunnel down'
+}
+
+// ─── Fleet Overview ───────────────────────────────────────────────────────
+// One row per server, fanned out by the hub. Clicking a server drills into its
+// dashboard, logs, reports and bans — the same views, scoped to that agent.
 function FleetOverview({ onSelect }) {
   const [data, loading, error, fetch] = useFetch(api.overview)
-  useEffect(() => {
-    fetch()
-    const t = setInterval(fetch, 15000)   // hub has no WS — poll the fleet
-    return () => clearInterval(t)
-  }, [])
+  usePoll(fetch, FLEET_POLL_MS)
 
   if (loading && !data) return <div className="fade-in"><Card><LoadingBox rows={6}/></Card></div>
   if (error)            return <div className="fade-in"><Card><ErrorBox message={error} onRetry={fetch}/></Card></div>
@@ -786,10 +826,12 @@ function FleetOverview({ onSelect }) {
                   <span style={{display:'inline-flex',alignItems:'center',gap:6}}>
                     <StatusDot ok={s.online}/>
                     <span style={{color:s.online?'var(--green)':'var(--accent2)',fontSize:11}}>
-                      {s.online ? 'online' : (s.reachable ? 'daemon down' : 'unreachable')}
+                      {s.online ? 'online' : (s.reachable ? 'daemon down' : statusLabel(s))}
                     </span>
                   </span>
-                  {s.error && !s.online && <span style={{marginLeft:8,color:'var(--text3)',fontSize:10}}>{s.error}</span>}
+                  {!s.online && (s.tunnelError || s.error) && (
+                    <span style={{marginLeft:8,color:'var(--text3)',fontSize:10}}>{s.tunnelError || s.error}</span>
+                  )}
                 </td>
                 <td style={{padding:'9px 14px',fontFamily:'var(--mono)',color:'var(--text2)'}}>{s.jailCount}</td>
                 <td style={{padding:'9px 14px',fontFamily:'var(--mono)',fontWeight:600,color:s.currentlyBanned>0?'var(--accent2)':'var(--text2)'}}>{s.currentlyBanned}</td>
@@ -833,19 +875,15 @@ const NAV = [
 ]
 
 export default function App() {
-  const [page,        setPage]        = useState('dashboard')
+  const [page,        setPage]        = useState('overview')
   const [jails,       setJails]       = useState([])
   const [daemonOk,    setDaemonOk]    = useState(null)
   const [loading,     setLoading]     = useState(true)
   const [error,       setError]       = useState(null)
-  const [wsState,     setWsState]     = useState('connecting')
   const [inspectedIP, setInspectedIP] = useState(null)   // ← modal state
   const [theme, toggleTheme] = useTheme()
-  const [authInfo, setAuthInfo] = useState(null)
-  const [mode,      setMode]     = useState('single')    // 'single' | 'hub'
-  const [servers,   setServers]  = useState([])          // hub only
-  const [serverId,  setServerId] = useState(null)        // hub: selected server
-  const wsRef = useRef(null)
+  const [servers,   setServers]  = useState([])
+  const [serverId,  setServerId] = useState(null)        // selected server, null = fleet
 
   const fetchJails = useCallback(async () => {
     setLoading(true); setError(null)
@@ -856,85 +894,38 @@ export default function App() {
     finally { setLoading(false) }
   }, [])
 
-  // Switch which server the per-server views target (hub mode).
+  // Switch which server the per-server views target.
   const selectServer = useCallback((id) => {
-    setServer(id)          // route module: prefix /api/servers/<id>
+    setServer(id)          // api module: prefix /api/servers/<id>
     setServerId(id)
     setJails([]); setDaemonOk(null)
     setPage('dashboard')
   }, [])
 
-  // ── Boot: detect single-server vs hub ──
+  // ── Boot: load the server registry from the hub ──
   useEffect(() => {
     let cancelled = false
     ;(async () => {
-      const detected = await detectMode()
-      if (cancelled) return
-
-      if (detected === 'hub') {
-        setMode('hub')
-        setAuthMode('apikey')
-        setAuthInfo({ mode: 'hub' })
-        setWsState('polling')
-        try {
-          const { servers } = await api.servers()
-          if (cancelled) return
-          setServers(servers || [])
-          setPage('overview')
-        } catch (e) { setError(e.message) }
-        finally { setLoading(false) }
-        return
-      }
-
-      // ── single-server (unchanged behaviour) ──
-      setMode('single')
       try {
-        const me = await api.me()
+        const { servers } = await api.servers()
         if (cancelled) return
-        setAuthMode(me.mode)
-        setAuthInfo(me)
-        if (me.mode === 'oidc' && !me.authenticated) { window.location.href = me.loginUrl; return }
+        setServers(servers || [])
       } catch (e) {
-        setError(e.message)
-        return
-      }
-
-      await fetchJails()
-
-      try {
-        const ws = await createWebSocket(
-          msg => {
-            if (msg.type==='status') {
-              if (msg.data.daemon!==undefined) setDaemonOk(msg.data.daemon.ok)
-              if (msg.data.jails?.length)      setJails(msg.data.jails)
-              setLoading(false)
-            }
-          },
-          () => setWsState('error')
-        )
-        ws.onopen  = () => setWsState('connected')
-        ws.onclose = () => setWsState('disconnected')
-        wsRef.current = ws
-      } catch (e) {
-        setWsState('error')
-        console.error('[WS] connect failed:', e.message)
+        if (!cancelled) setError(e.message)
+      } finally {
+        if (!cancelled) setLoading(false)
       }
     })()
-    return () => { cancelled = true; wsRef.current?.close() }
-  }, [fetchJails])
+    return () => { cancelled = true }
+  }, [])
 
-  // ── Hub mode has no WebSocket — poll the selected server every 10s ──
-  useEffect(() => {
-    if (mode !== 'hub' || !serverId) return
-    fetchJails()
-    const t = setInterval(fetchJails, 10000)
-    return () => clearInterval(t)
-  }, [mode, serverId, fetchJails])
+  // ── Refresh the selected server while it's on screen ──
+  usePoll(fetchJails, SERVER_POLL_MS, !!serverId && page !== 'overview')
 
   const totalBanned = jails.reduce((s,j)=>s+j.currentlyBanned,0)
   const openModal   = useCallback(ip => setInspectedIP(ip), [])
   const closeModal  = useCallback(()  => setInspectedIP(null), [])
-  const nav = mode === 'hub' ? [{ id:'overview', label:'Fleet', icon:Server }, ...NAV] : NAV
+  const nav = [{ id:'overview', label:'Fleet', icon:Server }, ...NAV]
   const currentServer = servers.find(s => s.id === serverId)
 
   return (
@@ -967,26 +958,24 @@ export default function App() {
           </div>
         </div>
 
-        {/* Server selector (hub mode) */}
-        {mode==='hub' && (
-          <div style={{padding:'10px 14px 4px',borderBottom:'0.5px solid var(--border)'}}>
-            <div style={{fontSize:9,color:'var(--text3)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:5,display:'flex',alignItems:'center',gap:5}}>
-              <Server size={10}/> Server
-            </div>
-            <select
-              value={serverId || ''}
-              onChange={e=> e.target.value ? selectServer(e.target.value) : (setServerId(null), setServer(null), setPage('overview'))}
-              style={{width:'100%',padding:'5px 8px',background:'var(--bg3)',border:'0.5px solid var(--border2)',borderRadius:'var(--radius)',color:'var(--text)',fontSize:12,outline:'none',cursor:'pointer'}}
-            >
-              <option value="">— Fleet overview —</option>
-              {servers.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
-            </select>
+        {/* Server selector */}
+        <div style={{padding:'10px 14px 4px',borderBottom:'0.5px solid var(--border)'}}>
+          <div style={{fontSize:9,color:'var(--text3)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:5,display:'flex',alignItems:'center',gap:5}}>
+            <Server size={10}/> Server
           </div>
-        )}
+          <select
+            value={serverId || ''}
+            onChange={e=> e.target.value ? selectServer(e.target.value) : (setServerId(null), setServer(null), setPage('overview'))}
+            style={{width:'100%',padding:'5px 8px',background:'var(--bg3)',border:'0.5px solid var(--border2)',borderRadius:'var(--radius)',color:'var(--text)',fontSize:12,outline:'none',cursor:'pointer'}}
+          >
+            <option value="">— Fleet overview —</option>
+            {servers.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
 
         <nav style={{flex:1,padding:'10px 8px'}}>
           {nav.map(({id,label,icon:Icon})=>{
-            const disabled = mode==='hub' && id!=='overview' && !serverId
+            const disabled = id!=='overview' && !serverId
             return (
             <button key={id} disabled={disabled} onClick={()=>setPage(id)} style={{display:'flex',alignItems:'center',gap:9,width:'100%',padding:'8px 10px',background:page===id?'rgba(226,75,74,.12)':'transparent',border:page===id?'0.5px solid rgba(226,75,74,.25)':'0.5px solid transparent',borderRadius:'var(--radius)',marginBottom:2,color:disabled?'var(--text3)':page===id?'var(--accent2)':'var(--text2)',fontSize:13,fontWeight:page===id?600:400,cursor:disabled?'not-allowed':'pointer',fontFamily:'var(--sans)',transition:'all .15s',opacity:disabled?0.5:1}}>
               <Icon size={14}/>{label}
@@ -998,7 +987,7 @@ export default function App() {
         </nav>
 
         <div style={{padding:'10px 14px',borderTop:'0.5px solid var(--border)',fontSize:11}}>
-          {mode==='hub' && !serverId ? (
+          {!serverId ? (
             <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:4}}>
               <Layers size={11} style={{color:'var(--text2)'}}/>
               <span style={{color:'var(--text2)'}}>{servers.length} servers</span>
@@ -1010,27 +999,9 @@ export default function App() {
             </div>
           )}
           <div style={{display:'flex',alignItems:'center',gap:6}}>
-            {mode==='hub'
-              ? <><RefreshCw size={10} style={{color:'var(--text3)'}}/><span style={{color:'var(--text3)'}}>live poll</span></>
-              : <>{wsState==='connected'?<Wifi size={10} style={{color:'var(--green)'}}/>:<WifiOff size={10} style={{color:'var(--text3)'}}/>}<span style={{color:'var(--text3)'}}>ws {wsState}</span></>
-            }
+            <RefreshCw size={10} style={{color:'var(--text3)'}}/>
+            <span style={{color:'var(--text3)'}}>live poll · {(serverId ? SERVER_POLL_MS : FLEET_POLL_MS)/1000}s</span>
           </div>
-          {authInfo?.mode==='oidc' && authInfo.user && (
-            <div style={{marginTop:8,paddingTop:8,borderTop:'0.5px solid var(--border)',display:'flex',alignItems:'center',gap:6}}>
-              <User size={11} style={{color:'var(--text2)',flexShrink:0}}/>
-              <span title={authInfo.user.email||authInfo.user.sub} style={{color:'var(--text2)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1}}>
-                {authInfo.user.name||authInfo.user.email||authInfo.user.sub}
-              </span>
-              <a href={authInfo.logoutUrl||'/logout'} title="Sign out" style={{color:'var(--text3)',display:'flex'}}>
-                <LogOut size={11}/>
-              </a>
-            </div>
-          )}
-          {authInfo?.mode==='oidc' && authInfo?.requiredGroup && authInfo.user && authInfo.user.inGroup===false && (
-            <div style={{marginTop:6,padding:'4px 6px',background:'rgba(246,173,85,0.12)',border:'0.5px solid rgba(246,173,85,0.3)',borderRadius:4,color:'var(--amber)',fontSize:10}}>
-              Read-only — missing group "{authInfo.requiredGroup}"
-            </div>
-          )}
         </div>
       </aside>
 
@@ -1039,7 +1010,7 @@ export default function App() {
         <div style={{padding:'11px 20px',borderBottom:'0.5px solid var(--border)',display:'flex',alignItems:'center',justifyContent:'space-between',background:'var(--bg2)',flexShrink:0}}>
           <div style={{fontSize:13,fontWeight:600,display:'flex',alignItems:'center',gap:8}}>
             {nav.find(n=>n.id===page)?.label}
-            {mode==='hub' && currentServer && page!=='overview' && (
+            {currentServer && page!=='overview' && (
               <span style={{fontSize:11,fontWeight:400,color:'var(--text3)'}}>
                 · <span style={{color:'var(--blue)'}}>{currentServer.name}</span>
               </span>
@@ -1053,9 +1024,9 @@ export default function App() {
         </div>
 
         <div style={{flex:1,padding:18,overflow:'auto'}}>
-          {page==='overview' && mode==='hub'
+          {page==='overview'
             ? <FleetOverview onSelect={selectServer}/>
-            : (mode==='hub' && !serverId)
+            : !serverId
               ? <div className="fade-in"><Card><div style={{padding:32,textAlign:'center',color:'var(--text3)',fontSize:13}}>Select a server from the sidebar to view its dashboard.</div></Card></div>
               : (<>
                   {page==='dashboard' && <Dashboard jails={jails} daemonOk={daemonOk} loading={loading} error={error} onRefresh={fetchJails} onInspect={openModal}/>}

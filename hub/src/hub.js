@@ -13,7 +13,7 @@
  *   - Hub binds to 127.0.0.1 by default; you reach it over an SSH tunnel.
  *   - Hub is authenticated with its own API key (constant-time compare).
  *   - Each agent stays loopback-only on its own host; the hub reaches it over
- *     an SSH tunnel to a distinct local port (see hub/tunnels.sh). The agent's
+ *     an SSH tunnel to a distinct local port (see hub/install-tunnels.sh). The agent's
  *     API key is stored server-side in servers.json and injected by the hub —
  *     it never reaches the browser.
  *   - Per-server requests fan out concurrently with a timeout; one dead server
@@ -31,6 +31,9 @@ const path      = require('path');
 const fs        = require('fs');
 const crypto    = require('crypto');
 
+const { mapLimit } = require('./mapLimit');
+const { TunnelSupervisor } = require('./tunnels');
+
 const app    = express();
 const server = http.createServer(app);
 
@@ -40,6 +43,23 @@ const API_SECRET   = process.env.HUB_API_SECRET || 'dev_hub_secret_change_me';
 const IS_PROD      = process.env.NODE_ENV === 'production';
 const AGENT_TIMEOUT = parseInt(process.env.AGENT_TIMEOUT_MS || '8000', 10);
 const SERVERS_FILE = process.env.HUB_SERVERS_FILE || path.resolve(__dirname, '../servers.json');
+
+// How many agents we query at once during a fleet fan-out. The point is not
+// to protect the hub — it's to avoid waking every monitored server in the
+// estate simultaneously, and to keep the hub's own socket/CPU use flat as the
+// fleet grows. Raise it if your fleet is large and your agents are idle.
+const FANOUT_CONCURRENCY = Math.max(1, parseInt(process.env.HUB_FANOUT_CONCURRENCY || '4', 10));
+
+// The fleet overview is identical for every viewer, so it is computed at most
+// once per window and shared. Ten browser tabs polling every 20s then cost the
+// agents one round of queries per window, not ten.
+const OVERVIEW_TTL_MS = parseInt(process.env.HUB_OVERVIEW_TTL_MS || '10000', 10);
+
+// Workstation mode: the hub opens and supervises its own SSH tunnels instead of
+// relying on systemd units. Lets someone run the whole dashboard on a laptop
+// with `npm start` and no root. On a server, prefer install-tunnels.sh.
+const MANAGE_TUNNELS = process.env.HUB_MANAGE_TUNNELS === 'true';
+const AGENT_PORT     = parseInt(process.env.AGENT_PORT || '3001', 10);
 
 // Only these agent API paths may be proxied through the hub, per HTTP method.
 // Anchored so nothing outside the known agent surface is reachable.
@@ -94,6 +114,22 @@ function loadServers() {
     s.baseUrl = s.baseUrl.replace(/\/+$/, '');
     s.name = s.name || s.id;
     s.apiKey = s.apiKey || '';
+    // Optional, and never used by the hub itself: install-tunnels.sh reads it
+    // to build this agent's systemd tunnel unit. Validated here so a typo
+    // surfaces at boot rather than at tunnel-install time.
+    if (s.ssh !== undefined && (typeof s.ssh !== 'string' || !s.ssh.trim())) {
+      console.error(`[hub] Server "${s.id}": "ssh" must be a non-empty string like "user@host".`);
+      process.exit(1);
+    }
+    if (!s.apiKey) {
+      console.warn(`[hub] WARNING: server "${s.id}" has no apiKey — the agent will reject its requests.`);
+    }
+    // An agent should be reached over a tunnel (loopback) or TLS. Plain http
+    // to a remote host would put that agent's key on the wire in clear.
+    if (/^http:\/\//.test(s.baseUrl) && !/^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|$)/.test(s.baseUrl)) {
+      console.warn(`[hub] WARNING: server "${s.id}" uses plain http to a non-loopback host (${s.baseUrl}).`);
+      console.warn('[hub]          Its API key travels unencrypted. Use an SSH tunnel to 127.0.0.1, or https.');
+    }
   }
   return list;
 }
@@ -102,6 +138,19 @@ const SERVERS = loadServers();
 const SERVER_BY_ID = new Map(SERVERS.map(s => [s.id, s]));
 // Public view of a server — never leak the agent apiKey to the browser.
 const publicServer = s => ({ id: s.id, name: s.name });
+
+// ─── Tunnels (workstation mode) ────────────────────────────────────────────
+const tunnels = MANAGE_TUNNELS
+  ? new TunnelSupervisor(SERVERS, { agentPort: AGENT_PORT, log: console.log })
+  : null;
+
+if (MANAGE_TUNNELS) {
+  const missing = SERVERS.filter(s => !s.ssh).map(s => s.id);
+  if (missing.length) {
+    console.warn(`[hub] HUB_MANAGE_TUNNELS is on but these servers have no "ssh" field: ${missing.join(', ')}`);
+    console.warn('[hub] They will only work if something else is already forwarding their baseUrl port.');
+  }
+}
 
 // ─── Call a single agent ───────────────────────────────────────────────────
 async function agentFetch(srv, apiPath, { method = 'GET', body, query } = {}) {
@@ -142,6 +191,7 @@ async function summariseServer(srv) {
       currentlyBanned,
       totalBanned,
       error: online ? null : (statusRes.data && statusRes.data.error) || null,
+      ...tunnelInfo(srv.id),
     };
   } catch (e) {
     return {
@@ -149,8 +199,19 @@ async function summariseServer(srv) {
       online: false, reachable: false,
       jailCount: 0, currentlyBanned: 0, totalBanned: 0,
       error: e.name === 'TimeoutError' ? 'timeout' : e.message,
+      ...tunnelInfo(srv.id),
     };
   }
+}
+
+// When the hub owns the tunnel it can say *why* a server is unreachable —
+// "the tunnel is down" and "the agent is down" look identical from a failed
+// fetch, and they need different fixes.
+function tunnelInfo(id) {
+  if (!tunnels) return {};
+  const t = tunnels.status(id);
+  if (!t) return {};
+  return { tunnel: t.state, tunnelError: t.lastError || null };
 }
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
@@ -206,9 +267,16 @@ app.get('/api/servers', requireKey, (req, res) => {
   res.json({ servers: SERVERS.map(publicServer) });
 });
 
-// Fleet overview — concurrent fan-out to every server.
-app.get('/api/overview', requireKey, async (req, res) => {
-  const servers = await Promise.all(SERVERS.map(summariseServer));
+// ─── Fleet overview ─────────────────────────────────────────────────────────
+// Fan out to every server with bounded concurrency, then cache the result for
+// OVERVIEW_TTL_MS. Concurrent callers during a fan-out share the in-flight
+// promise, so however many operators are watching, each agent sees at most one
+// round of queries per window.
+let overviewCache = null;      // { expiry, payload }
+let overviewInflight = null;   // Promise
+
+async function buildOverview() {
+  const servers = await mapLimit(SERVERS, FANOUT_CONCURRENCY, summariseServer);
   const totals = servers.reduce((t, s) => ({
     servers:         t.servers + 1,
     online:          t.online + (s.online ? 1 : 0),
@@ -217,7 +285,30 @@ app.get('/api/overview', requireKey, async (req, res) => {
     totalBanned:     t.totalBanned + s.totalBanned,
     jailCount:       t.jailCount + s.jailCount,
   }), { servers: 0, online: 0, offline: 0, currentlyBanned: 0, totalBanned: 0, jailCount: 0 });
-  res.json({ totals, servers });
+  return { totals, servers, generatedAt: new Date().toISOString() };
+}
+
+function getOverview() {
+  const now = Date.now();
+  if (overviewCache && overviewCache.expiry > now) return Promise.resolve(overviewCache.payload);
+  if (overviewInflight) return overviewInflight;
+
+  overviewInflight = buildOverview()
+    .then(payload => {
+      if (OVERVIEW_TTL_MS > 0) overviewCache = { expiry: Date.now() + OVERVIEW_TTL_MS, payload };
+      return payload;
+    })
+    .finally(() => { overviewInflight = null; });
+  return overviewInflight;
+}
+
+app.get('/api/overview', requireKey, async (req, res) => {
+  try {
+    res.json(await getOverview());
+  } catch (e) {
+    console.error('[hub] overview failed:', e && e.message);
+    res.status(500).json({ error: IS_PROD ? 'Overview failed' : (e && e.message) });
+  }
 });
 
 // Proxy a whitelisted agent endpoint for a specific server.
@@ -241,6 +332,9 @@ app.use('/api/servers/:id', requireKey, async (req, res) => {
       body:   ['POST', 'PUT', 'PATCH'].includes(req.method) ? req.body : undefined,
       query:  qs,
     });
+    // A ban/unban changes the fleet's banned counts — drop the cached overview
+    // so the operator doesn't watch a stale total for up to a full window.
+    if (out.ok && req.method !== 'GET') overviewCache = null;
     res.status(out.status).json(out.data);
   } catch (e) {
     const msg = e.name === 'TimeoutError' ? `Server "${srv.id}" timed out` : e.message;
@@ -268,12 +362,25 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`\n🛡  Fail2Ban Dashboard HUB`);
   console.log(`   Listening on http://${BIND_ADDRESS}:${PORT}`);
   console.log(`   Servers:      ${SERVERS.length} (${SERVERS.map(s => s.id).join(', ')})`);
-  console.log(`   SPA serving:  ${SERVE_STATIC ? 'on' : 'off'}`);
-  console.log(`   Environment:  ${process.env.NODE_ENV || 'development'}\n`);
+  console.log(`   Fan-out:      ${FANOUT_CONCURRENCY} at a time · ${AGENT_TIMEOUT}ms timeout`);
+  console.log(`   Overview:     cached ${OVERVIEW_TTL_MS}ms, shared by all viewers`);
+  console.log(`   Tunnels:      ${MANAGE_TUNNELS ? 'managed by this process' : 'external (systemd / already open)'}`);
+  console.log(`   SPA serving:  ${SERVE_STATIC ? 'on' : 'off (run: cd ../frontend && npm run build)'}`);
+  console.log(`   Environment:  ${process.env.NODE_ENV || 'development'}`);
+  if (BIND_ADDRESS === '127.0.0.1') {
+    console.log(`\n   → Open http://localhost:${PORT} (or forward this port over SSH)\n`);
+  } else {
+    console.log('');
+  }
+  if (API_SECRET === 'dev_hub_secret_change_me') {
+    console.warn('[WARN] HUB_API_SECRET is the default value. Generate one before deploying.\n');
+  }
+  if (tunnels) tunnels.start();
 });
 
 function shutdown(sig) {
   console.log(`\n[${sig}] Shutting down hub…`);
+  if (tunnels) tunnels.stopAll();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5000).unref();
 }

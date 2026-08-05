@@ -1,50 +1,44 @@
 /**
- * useApi.js — thin fetch wrapper, works against a single-server agent OR a hub.
+ * useApi.js — thin fetch wrapper. The dashboard talks to ONE thing: the hub.
  *
- * Context is detected once at boot via GET /api/mode:
- *   - Hub responds { mode: 'hub' } → server-scoped calls are routed through
- *     /api/servers/<id>/… and the hub fans out to each agent.
- *   - A single-server agent has no /api/mode (404) → we fall back to its
- *     /api/auth/me contract and talk to /api/… directly, exactly as before.
+ * The hub is the only web-facing service in this architecture. Agents run on
+ * the monitored servers with no UI, and the browser never contacts them
+ * directly — every server-scoped call goes to /api/servers/<id>/… and the hub
+ * proxies it to that agent using the agent's own key, held server-side.
  *
- * Auth: the X-API-Key header carries whatever secret matches the server that
- * built + served this bundle (the agent's API_SECRET in single mode, the
- * HUB_API_SECRET in hub mode). WebSocket live-updates exist only in
- * single-server apikey mode; the hub uses polling.
+ * Auth: X-API-Key carries HUB_API_SECRET, baked into this bundle at build
+ * time. Whoever can load the page holds it — the hub is meant to be reached
+ * over an SSH tunnel, not published.
+ *
+ * There is no WebSocket. Live updates are polled, so that N open tabs cost the
+ * fleet a bounded, shared number of queries: the hub caches and coalesces its
+ * fan-out, and each agent caches its own fail2ban reads.
  */
 
-const API_KEY = import.meta.env.VITE_API_KEY || 'dev_secret_change_me'
+const API_KEY = import.meta.env.VITE_API_KEY || 'dev_hub_secret_change_me'
 const BASE    = '/api'
-const WS_SUBPROTOCOL = 'fail2ban-api-key'
 
-let _mode     = 'single'   // 'single' | 'hub'
-let _authMode = 'apikey'   // single-server only: 'apikey' | 'oidc'
-let _serverId = null       // hub only: which server server-scoped calls target
+let _serverId = null       // which server the server-scoped calls target
 
-export function getMode()   { return _mode }
-export function setMode(m)  { _mode = (m === 'hub') ? 'hub' : 'single' }
-export function setAuthMode(mode) { _authMode = (mode === 'oidc') ? 'oidc' : 'apikey' }
-export function getAuthMode() { return _authMode }
 export function setServer(id) { _serverId = id || null }
 export function getServer()   { return _serverId }
 
-// Route a server-scoped path through the hub when we're in hub mode with a
-// selected server; otherwise hit the path directly.
+// Server-scoped paths always route through the hub. Calling one with no server
+// selected is a caller bug, not a request worth sending.
 function scoped(path) {
-  if (_mode === 'hub' && _serverId) return `/servers/${encodeURIComponent(_serverId)}${path}`
-  return path
+  if (!_serverId) throw new Error('No server selected')
+  return `/servers/${encodeURIComponent(_serverId)}${path}`
 }
 
 async function apiFetch(path, options = {}) {
-  const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) }
-  if (_authMode === 'apikey') headers['X-API-Key'] = API_KEY
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-API-Key': API_KEY,
+    ...(options.headers || {}),
+  }
 
   const res = await fetch(`${BASE}${path}`, { credentials: 'same-origin', ...options, headers })
 
-  if (res.status === 401) {
-    const body = await res.json().catch(() => ({}))
-    if (body.login) { window.location.href = body.login; throw new Error('Redirecting to login') }
-  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }))
     throw new Error(body.error || `HTTP ${res.status}`)
@@ -52,28 +46,13 @@ async function apiFetch(path, options = {}) {
   return res.json()
 }
 
-// Detect whether we're behind a hub. Never throws — defaults to single-server.
-export async function detectMode() {
-  try {
-    const res = await fetch(`${BASE}/mode`, { credentials: 'same-origin' })
-    if (res.ok) {
-      const data = await res.json().catch(() => ({}))
-      if (data.mode === 'hub') { _mode = 'hub'; return 'hub' }
-    }
-  } catch { /* fall through */ }
-  _mode = 'single'
-  return 'single'
-}
-
 export const api = {
   // ── hub-level (no server scope) ──
+  mode:      ()              => apiFetch('/mode'),
   servers:   ()              => apiFetch('/servers'),
   overview:  ()              => apiFetch('/overview'),
 
-  // ── single-server discovery ──
-  me:        ()              => apiFetch('/auth/me'),
-
-  // ── server-scoped (routed via hub when applicable) ──
+  // ── server-scoped (proxied by the hub to one agent) ──
   status:    ()              => apiFetch(scoped('/status')),
   jails:     ()              => apiFetch(scoped('/jails')),
   jail:      (name)          => apiFetch(scoped(`/jails/${encodeURIComponent(name)}`)),
@@ -87,15 +66,4 @@ export const api = {
   security:  ()              => apiFetch(scoped('/security')),
   ipDetails: (ip)            => apiFetch(scoped(`/ip/${encodeURIComponent(ip)}/details`)),
   ipGeo:     (ip)            => apiFetch(scoped(`/ip/${encodeURIComponent(ip)}/geo`)),
-  wsTicket:  ()              => apiFetch('/ws-ticket', { method: 'POST' }),
-}
-
-export async function createWebSocket(onMessage, onError) {
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const secret = _authMode === 'oidc' ? (await api.wsTicket()).ticket : API_KEY
-  const ws = new WebSocket(`${proto}//${window.location.host}/ws`, [WS_SUBPROTOCOL, secret])
-  ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)) } catch {} }
-  ws.onerror   = onError
-  ws.onclose   = () => console.log('[WS] Connection closed')
-  return ws
 }
