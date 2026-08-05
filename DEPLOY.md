@@ -266,14 +266,20 @@ Dashboard page.
 
 ## Managing multiple servers
 
-This dashboard is **single-server by design**: each backend only talks to the
-fail2ban running on its *own* machine. There is **no central aggregation** — one
-dashboard instance shows one server's jails, bans, and logs. Instances know
-nothing about each other, so attacks on one server never appear in another's view.
+Each dashboard install ("agent") talks only to the fail2ban on its *own* machine.
+To monitor several servers you have **two options** — pick one:
 
-To monitor several servers, deploy the dashboard on each (repeat Parts 1–6 per
-host), then tunnel to each on a **different local port** — one browser tab per
-server:
+- **A. One tab per server (no extra service).** Deploy an agent on each server,
+  then open a separate SSH tunnel per server on a different local port.
+- **B. One combined dashboard (the hub).** Deploy an agent on each server, then
+  run the **hub** — a small aggregator that fans out to every agent and gives you
+  a fleet overview plus a server picker, with the same per-server views. This is
+  the "single pane of glass".
+
+### Option A — one tab per server
+
+Deploy the dashboard on each server (repeat Parts 1–6 per host), then tunnel to
+each on a **different local port**:
 
 ```bash
 # Server A → laptop port 3001
@@ -290,17 +296,93 @@ The number on the **right** is always `3001` (the port the backend listens on
 *inside* each server). Only the number on the **left** — your laptop's local
 port — changes, so each tab maps to a distinct server.
 
-### One combined view across all servers
+### Option B — one combined dashboard (the hub)
 
-If you'd rather have a **single dashboard** with a fleet overview and a server
-picker — instead of one browser tab per server — deploy the **hub**. Each server
-stays a normal agent (this guide, Parts 1–6); the hub aggregates them and lets
-you drill into any one with the same per-server views. See
-**[`hub/README.md`](hub/README.md)** for the full setup.
+The hub reaches each agent over an SSH tunnel and authenticates with that agent's
+own key (kept server-side, never sent to the browser). You then tunnel to the hub
+and see everything in one place. It's a *live* aggregator (no stored history),
+comfortable up to a few dozen servers. Full reference: **[`hub/README.md`](hub/README.md)**.
 
-The hub is a *live* aggregator (no stored history), comfortable up to a few dozen
-servers. The per-server + per-port-tunnel approach above still works and needs no
-extra service — pick whichever fits.
+Run these on the **hub host** — any box that can SSH to every agent (a dedicated
+management box, or one of the servers).
+
+**1. Deploy an agent on every server** you want to monitor — Parts 1–6 above, on
+each host. Note each agent's `API_SECRET` (from its `backend/.env`).
+
+**2. Install the hub:**
+```bash
+cd /opt/fail2ban-dashboard/hub
+npm install
+cp .env.example .env
+# Generate the hub's own key and put it in .env as HUB_API_SECRET:
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+nano .env      # set HUB_API_SECRET, NODE_ENV=production, keep HUB_BIND_ADDRESS=127.0.0.1
+```
+
+**3. Open a tunnel to each agent** — edit the `AGENTS` list in `hub/tunnels.sh`
+(one line per agent: `"<localPort> <ssh-target>"`), then:
+```bash
+bash tunnels.sh
+ss -tlnp | grep -E '410[0-9]'      # confirm the local ports are listening
+```
+Each agent is now reachable at `http://127.0.0.1:<localPort>` on the hub host.
+(For production, run these as `autossh` or per-tunnel systemd units so they
+auto-reconnect.)
+
+**4. Register the servers:**
+```bash
+cp servers.example.json servers.json
+nano servers.json
+```
+For each agent set `id`, `name`, the tunnel `baseUrl`
+(`http://127.0.0.1:<localPort>`), and that agent's `API_SECRET` as `apiKey`.
+`servers.json` holds every agent's secret — it's **gitignored; never commit it**.
+
+**5. Build the SPA with the hub's key** (the bundle's embedded key must be the
+*hub* secret, not an agent's):
+```bash
+cd ../frontend
+echo "VITE_API_KEY=$(grep '^HUB_API_SECRET' ../hub/.env | cut -d= -f2)" > .env.local
+npm run build
+cd ../hub
+```
+
+**6. Run the hub as a service:**
+```bash
+sudo tee /etc/systemd/system/fail2ban-hub.service >/dev/null <<EOF
+[Unit]
+Description=Fail2Ban Dashboard Hub
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=/opt/fail2ban-dashboard/hub
+EnvironmentFile=/opt/fail2ban-dashboard/hub/.env
+ExecStart=/usr/bin/node src/hub.js
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now fail2ban-hub
+ss -tlnp | grep 3100               # MUST show 127.0.0.1:3100
+
+# Verify the fan-out (every server should show online:true with jail counts):
+curl -s -H "X-API-Key: $(grep '^HUB_API_SECRET' .env | cut -d= -f2)" \
+     http://127.0.0.1:3100/api/overview; echo
+```
+An `online:false` server means its tunnel is down or its `apiKey` in
+`servers.json` is wrong.
+
+**7. Access the hub** from your laptop:
+```bash
+ssh -L 3100:127.0.0.1:3100 youruser@HUB_HOST_IP     # → http://localhost:3100
+```
+You land on the **Fleet overview**; pick a server (sidebar dropdown or click a
+row) to drill into its per-server dashboard.
 
 ---
 

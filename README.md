@@ -7,7 +7,9 @@ A lightweight, security-hardened web dashboard for monitoring and managing Fail2
 > **Deploying to a server?** For a hardened, tunnel-only server install (bind to
 > loopback, run as a `systemd` service, reach it over SSH — nothing exposed to the
 > network), follow **[`DEPLOY.md`](DEPLOY.md)**. It's a start-to-finish, verified
-> walkthrough. The Quick Start below is for local development.
+> walkthrough, and its *Managing multiple servers* section covers both one-tab-per-server
+> and the combined **[hub](hub/README.md)** dashboard. The Quick Start below is for
+> local development.
 
 ---
 
@@ -102,8 +104,14 @@ fail2ban-dashboard/
 │   ├── .env.example
 │   ├── index.html
 │   └── vite.config.js
+├── hub/                     # optional multi-server aggregator
+│   ├── src/hub.js           # fans out to each agent, serves the fleet view
+│   ├── servers.example.json # per-agent registry (copy to servers.json)
+│   ├── tunnels.sh           # opens SSH tunnels to each agent
+│   └── README.md            # hub setup guide
 ├── docs/
 │   └── SECURITY.md
+├── DEPLOY.md                # hardened tunnel-only server + multi-server setup
 ├── setup.sh
 └── README.md
 ```
@@ -158,6 +166,18 @@ cd ../backend && cp .env.example .env
 # 3. Start it (or better, run it as a systemd service — see DEPLOY.md Part 6)
 NODE_ENV=production node src/server.js
 ```
+
+### Multiple servers
+
+Two ways to monitor a fleet, both in **[`DEPLOY.md`](DEPLOY.md)** → *Managing
+multiple servers*:
+
+- **One tab per server** — deploy an agent on each and tunnel to each on a
+  different local port. No extra service.
+- **Combined dashboard (hub)** — run the optional **[hub](hub/README.md)**, which
+  aggregates every agent into a single fleet overview with a server picker and
+  per-server drill-down. Live aggregator (no stored history), good for up to a
+  few dozen servers.
 
 When `frontend/dist/index.html` exists, the backend serves the SPA from the same origin — one process, one port, one auth boundary. The startup banner confirms it:
 
