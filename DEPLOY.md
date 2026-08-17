@@ -46,20 +46,54 @@ identical either way.
 The detail is in Parts A and B; this is the sequence, so you always know what's
 next. Roughly 20 minutes for the first server, ~5 for each one after.
 
-| # | Where | Do this | You're done when |
-|---|---|---|---|
-| 1 | GitHub | Host the repo; confirm no config went with it (*Secrets and hosting* below) | `git ls-files` shows no `servers.json` or `.env` |
-| 2 | First monitored server | Part A — pre-flight, install agent, sudo rule, systemd unit | `/api/health` returns `role":"agent"` and `/api/status` returns `ok":true` |
-| 3 | — | **Copy that server's `API_SECRET`** (`grep '^API_SECRET' backend/.env`) | you have it pasted somewhere safe |
-| 4 | Hub machine (your laptop or a server) | Part B — `setup.sh hub --local` (or `hub`) | `HUB_API_SECRET` generated, UI built |
-| 5 | Hub machine | Add server #1 to `hub/servers.json`: id, name, free local port, its `API_SECRET`, `ssh` target | `chmod 600 hub/servers.json` done |
-| 6 | Hub machine | `ssh -o BatchMode=yes user@server true` | prints nothing / no password prompt |
-| 7 | Hub machine | `cd hub && npm start` | `[tunnel] … up`, and **http://localhost:3100** shows one green row |
-| 8 | Each further server | Repeat 2–3, then add an entry on the next free port and restart the hub | new row appears in the fleet overview |
+Do the servers first, the UI machine second — the hub needs a key that only
+exists once an agent has been installed.
 
-Two things people trip on, both covered below: the agent's `API_SECRET` in
-`servers.json` must match that server's `backend/.env` exactly, and the hub
-machine must reach each server over SSH **without a password**.
+> **One command instead of Part A.** Once you have a hub set up,
+> `bash hub/enroll.sh youruser@SERVER_IP` does everything in the first table
+> below over SSH — install, sudoers, service, verify — and registers the server
+> here with its key, so the key never passes through a clipboard. Use
+> `--dry-run` first to see the pre-flight without changing anything. The manual
+> steps stay documented because you should know what it does to your box.
+
+**On each monitored server** (Part A; ~10 minutes for the first, ~5 after):
+
+| # | Do this | You're done when |
+|---|---|---|
+| 0 | Add the hub's IP to `ignoreip` (*Step 0*) | `fail2ban-client get sshd ignoreip` lists it |
+| 1 | A0 pre-flight: `fail2ban-client ping`, `node -v` ≥ 18, port 3001 free, note your login user | all five checks pass |
+| 2 | A4 install: clone to `/opt/fail2ban-dashboard`, `bash setup.sh agent` | it prints this server's `API_SECRET` |
+| 3 | A5 access: sudoers rule for `fail2ban-client`, `usermod -aG adm $USER`, **reconnect SSH** | `sudo -n fail2ban-client ping` → `pong` |
+| 4 | A6 service: install the `fail2ban-agent` unit, enable it | `/api/health` → `role":"agent"`, `/api/status` → `ok":true` |
+| 5 | Copy the `API_SECRET` (`grep '^API_SECRET' backend/.env`) | it's pasted somewhere safe for step 7 |
+
+Skip A1 (hardening) and A2 (installing fail2ban) on any live server — see *Quick
+path for an already-configured live server*.
+
+**On the machine the UI is accessed from** (Part B). If that's your own
+laptop/desktop, this is the whole thing — no root, no systemd, nothing left
+running:
+
+| # | Do this | You're done when |
+|---|---|---|
+| 6 | `bash setup.sh hub --local` | `HUB_API_SECRET` generated, `frontend/dist` built |
+| 7 | Edit `hub/servers.json`: **one entry per real agent, and delete the rest.** Give each a free local port (4101, 4102, …), its own `API_SECRET`, its `ssh` target | no `PASTE_` or `.example.com` left — the hub refuses to start otherwise |
+| 8 | `ssh -o BatchMode=yes youruser@SERVER_IP true` | no password prompt |
+| 9 | `cd hub && npm start` | one `[tunnel] <id> up` line per server, then quiet |
+| 10 | Open **http://127.0.0.1:3100** | a green row per server, with its real jail count |
+| 11 | Each further server: repeat 1–5 there, add an entry, restart the hub | the new row appears in the fleet overview |
+
+For a shared hub on a management server instead, steps 6–10 differ slightly
+(systemd tunnels, and viewers reach it over `ssh -L`) — follow **B-server**.
+
+Four things people trip on, all covered below:
+
+- The `API_SECRET` in `servers.json` must match that server's `backend/.env`
+  **exactly** — a mismatch is a `403` from that agent.
+- The hub machine must reach every server over SSH **without a password**.
+- **Unedited example entries** in `servers.json` cause endless tunnel-reconnect
+  noise and permanent offline rows. Delete what you don't use.
+- Use **`127.0.0.1:3100`, not `localhost:3100`** — see *Gotchas*.
 
 ### Upgrading a server that ran the older single-service build
 
@@ -100,6 +134,45 @@ ssh -o BatchMode=yes youruser@SERVER_IP true && echo "key auth OK"
 
 That last line is the exact check `install-tunnels.sh` runs later; if it fails,
 the tunnel to that server won't come up.
+
+### Exempt the hub's IP from fail2ban — do this before you start
+
+You are installing a tool that connects to fail2ban-protected servers, over and
+over, from one address. **Exempt that address on every monitored server, or
+sooner or later it gets banned** — the hub holds a long-lived SSH connection per
+server and reconnects with backoff, and any jail with an all-ports action takes
+your shell down with the tunnel.
+
+On each monitored server, in `/etc/fail2ban/jail.local`:
+
+```ini
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1 <hub public IP>
+```
+
+```bash
+sudo fail2ban-client reload
+sudo fail2ban-client get sshd ignoreip     # confirm it's there
+```
+
+Find the address the server actually sees you as — NAT and VPNs make guessing
+unreliable:
+
+```bash
+ssh youruser@SERVER_IP 'echo ${SSH_CLIENT%% *}'
+```
+
+> **If you do get locked out:** the host answers `ping` but every port times
+> out. You need out-of-band access — your provider's serial/VNC console, or any
+> other network — and then:
+>
+> ```bash
+> sudo fail2ban-client unban <your IP>      # clears it from every jail
+> sudo fail2ban-client banned               # what's currently banned, per jail
+> ```
+>
+> A dynamic hub address is a real hazard here. Prefer a static IP for the hub,
+> or exempt the range it comes from.
 
 > ⚠️ **If you also plan to run the A1 hardening block** (fresh servers only — it
 > disables password login), confirm key auth works *first* and keep a second SSH
@@ -461,7 +534,11 @@ ssh -o BatchMode=yes deploy@your-server true && echo "key auth OK"
 ```
 
 **3. Register your servers** in `hub/servers.json` — same fields as B2 below.
-`baseUrl` ports are local to *your* machine, so pick anything free (4101, 4102, …):
+`baseUrl` ports are local to *your* machine, so pick anything free (4101, 4102, …).
+**One entry per agent you actually have, and delete every entry you don't** — an
+unedited example entry is a tunnel that can never connect, so you get reconnect
+noise in the log and an offline row that looks like a real failure. The hub
+refuses to start while any `PASTE_…` key or `*.example.com` host remains.
 
 ```json
 [
@@ -470,19 +547,38 @@ ssh -o BatchMode=yes deploy@your-server true && echo "key auth OK"
 ]
 ```
 
+```bash
+chmod 600 hub/servers.json
+```
+
 **4. Start it:**
 
 ```bash
 cd hub && npm start
 ```
 
-You'll see a tunnel line per server, then the dashboard is at
-**http://localhost:3100** — no `ssh -L` needed, the hub is already local.
+One tunnel line per server, then quiet — that's a healthy start:
 
 ```
-[tunnel] managing 2 tunnel(s) with ssh
+[tunnel] managing 1 tunnel(s) with ssh
 [tunnel] test-01 up — 127.0.0.1:4101 → deploy@test-01:127.0.0.1:3001
 ```
+
+**5. Open http://127.0.0.1:3100.** No `ssh -L` — the hub is already on this
+machine; forwarding port 3100 from somewhere else will only shadow it. Prefer
+the literal `127.0.0.1` over `localhost`, which can resolve to `::1` first and
+pick up an unrelated listener (see *Gotchas*).
+
+**Verify without the browser,** which is faster to diagnose:
+
+```bash
+curl -s -H "X-API-Key: $(grep '^HUB_API_SECRET' .env | cut -d= -f2)" \
+     http://127.0.0.1:3100/api/overview
+```
+
+Each server should read `reachable: true, online: true` with a real
+`jailCount`. If not: `reachable:false` is the tunnel, `online:false` is that
+server's A5 sudo rule, and `403` is an `apiKey` mismatch.
 
 Tunnels reconnect on their own with exponential backoff (a server down for an
 hour doesn't mean a reconnect storm), and Ctrl-C closes every one of them.
@@ -636,8 +732,27 @@ selected server.
 
 ## Adding a live server later
 
-This is the routine you'll repeat for the rest of your fleet. About five
-minutes per server.
+One command from the hub, for a server that already runs fail2ban:
+
+```bash
+bash hub/enroll.sh --dry-run deploy@new-server    # pre-flight only, changes nothing
+bash hub/enroll.sh deploy@new-server              # then do it
+```
+
+It checks key auth, pre-flights the box (fail2ban present, Node 18+, port free),
+warns if the hub's IP isn't exempt from that server's jails, installs and starts
+the agent, verifies `/api/health` and `/api/status`, and writes the registry
+entry — picking the next free tunnel port and copying the `API_SECRET` straight
+across, so the two can't disagree. Re-running it updates the code and keeps the
+existing key, which makes it the upgrade path too. Useful flags:
+`--id/--name` (registry identity), `--install-node`, `--branch`, `--dir`,
+`--no-service`.
+
+Then restart the hub — the registry is read at startup — and for a shared hub
+re-run `install-tunnels.sh` as well.
+
+<details>
+<summary>The same thing by hand</summary>
 
 **On the new server** — Part A, skipping A1 and A2 (see *Quick path for an
 already-configured live server*):
@@ -668,6 +783,8 @@ sudo bash hub/install-tunnels.sh --status
 It appears in the fleet overview on the next poll. If it shows offline, work
 outward: tunnel (`--status`) → agent (`journalctl -u fail2ban-agent` on that
 host) → `apiKey` mismatch.
+
+</details>
 
 To remove one again, see [A7](#a7--removing-an-agent-rollback).
 
@@ -767,10 +884,28 @@ sudo systemctl restart fail2ban-agent
 
 ### Gotchas
 
+- **fail2ban can ban your hub — and your shell with it.** Symptom: the host
+  answers `ping` but SSH (and everything else, if the jail uses an allports
+  action) times out. Exempt the hub's IP on every monitored server *before* you
+  start (*Step 0*); recover with `fail2ban-client unban <ip>` from a console or
+  another network. Beware anything that generates repeated auth failures on a
+  monitored box — a failing `sudo -n` writes a PAM failure to `auth.log`, which
+  `pam-generic`-style jails ban on.
 - **Log reads need a reconnect.** After `usermod -aG adm`, the group only applies
   to new sessions — reconnect SSH and restart the agent before the log viewer and
   IP investigation work.
 - **`servers.json` is read at startup.** Restart the hub after editing it.
+- **Delete unused example entries from `servers.json`.** Each one becomes a
+  tunnel to a host that doesn't resolve — backoff noise in the hub log and an
+  offline row that reads like a real outage. The hub now refuses to start while
+  a `PASTE_…` key or an `*.example.com` target is present.
+- **Use `http://127.0.0.1:3100`, not `http://localhost:3100`.** `localhost`
+  resolves to `::1` before `127.0.0.1` on most systems, and the hub binds IPv4
+  loopback only. A stray `ssh -L 3100:…` from an earlier session holds `[::1]:3100`
+  and will silently swallow the request — the page just fails to load while the
+  hub is perfectly healthy. Check with `ss -tlnp | grep 3100`: you want exactly
+  one `node` on `127.0.0.1:3100`. Kill any leftover `ssh -L` forward for that
+  port — a local hub needs none.
 - **Reload fail2ban after config changes:** `sudo fail2ban-client reload`. The
   dashboard reflects it within one poll plus one cache window.
 - **Verify bind addresses.** `ss -tlnp | grep 3001` on an agent and `grep 3100`

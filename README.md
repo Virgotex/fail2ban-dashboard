@@ -133,19 +133,23 @@ bash setup.sh agent          # API only — no UI is installed here
 
 Plus the sudo rule and systemd unit from [`DEPLOY.md`](DEPLOY.md) Part A.
 
-**2. On your own machine** (or a management server — see *Where does the hub
-run?* above):
+**2. On the machine you want the dashboard on** — your own laptop, or a
+management server (see *Where does the hub run?* above):
 
 ```bash
 git clone https://github.com/virgotex/fail2ban-dashboard.git
 cd fail2ban-dashboard
 bash setup.sh hub --local    # generates the hub key, builds the UI
 
-nano hub/servers.json        # one entry per agent: tunnel port, its API_SECRET, ssh target
+nano hub/servers.json        # one entry per agent: tunnel port, its API_SECRET, ssh
+                             # target — and DELETE any entry you don't use
+ssh -o BatchMode=yes youruser@SERVER_IP true    # must not prompt for a password
 cd hub && npm start          # opens the tunnels and serves the dashboard
 ```
 
-**3. Open http://localhost:3100.**
+**3. Open http://127.0.0.1:3100.** Not `localhost` — that can resolve to `::1`
+and hit a stray `ssh -L` forward instead of the hub. A local hub needs no
+`ssh -L` of its own.
 
 On a shared hub instead, drop `--local`, run
 `sudo TUNNEL_USER=$USER bash hub/install-tunnels.sh` for systemd tunnels, and

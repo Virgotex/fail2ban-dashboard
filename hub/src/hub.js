@@ -124,6 +124,14 @@ function loadServers() {
     if (!s.apiKey) {
       console.warn(`[hub] WARNING: server "${s.id}" has no apiKey — the agent will reject its requests.`);
     }
+    // Leftovers from servers.example.json. Left in, they produce a permanently
+    // offline row and an endless tunnel-reconnect log — indistinguishable at a
+    // glance from a real server being down. Refuse to start instead.
+    if (/^PASTE_/.test(s.apiKey) || /\.example\.com(:|$)/.test(s.ssh || '')) {
+      console.error(`[hub] Server "${s.id}" is still an unedited example entry.`);
+      console.error('[hub] Delete the entries you do not use from servers.json, and fill in the rest.');
+      process.exit(1);
+    }
     // An agent should be reached over a tunnel (loopback) or TLS. Plain http
     // to a remote host would put that agent's key on the wire in clear.
     if (/^http:\/\//.test(s.baseUrl) && !/^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|$)/.test(s.baseUrl)) {

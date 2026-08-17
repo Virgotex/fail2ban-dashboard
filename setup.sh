@@ -130,8 +130,21 @@ else
 fi
 
 if [ ! -f hub/servers.json ]; then
-  cp hub/servers.example.json hub/servers.json
-  echo -e "${GREEN}✓ Created hub/servers.json from the example${NC}"
+  # One entry, not the three-server example: every entry you leave unedited is a
+  # dead tunnel and a permanently offline row in the fleet view.
+  cat > hub/servers.json <<'EOF'
+[
+  {
+    "id": "server-01",
+    "name": "Server 01",
+    "baseUrl": "http://127.0.0.1:4101",
+    "apiKey": "PASTE_THE_AGENT_API_SECRET_HERE",
+    "ssh": "youruser@your-server-hostname-or-ip"
+  }
+]
+EOF
+  chmod 600 hub/servers.json
+  echo -e "${GREEN}✓ Created hub/servers.json (one starter entry, mode 600)${NC}"
   NEEDS_REGISTRY=1
 else
   echo -e "${YELLOW}⚠  hub/servers.json already exists — leaving it alone${NC}"
