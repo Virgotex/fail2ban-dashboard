@@ -15,7 +15,7 @@ laptop**:
 ```
    ┌─────────────────────────────────────┐
    │  HUB  — your laptop, or a server    │  the dashboard: serves the UI,
-   │  http://localhost:3100              │  holds the agent keys, fans out
+   │  http://127.0.0.1:3100              │  holds the agent keys, fans out
    └─────────────────────────────────────┘
         │  SSH tunnels (auto-reconnecting)
         ├──────────────▶ AGENT web-01   127.0.0.1:3001 ──▶ fail2ban
@@ -47,8 +47,8 @@ no systemd, nothing left running:
 git clone https://github.com/virgotex/fail2ban-dashboard.git
 cd fail2ban-dashboard
 bash setup.sh hub --local
-nano hub/servers.json        # your servers: tunnel port, agent key, ssh target
-cd hub && npm start          # → http://localhost:3100
+bash hub/enroll.sh you@server-01    # installs the agent there and registers it
+cd hub && npm start                 # → http://127.0.0.1:3100
 ```
 
 Anyone who needs the dashboard does the same on their machine. Connecting to
@@ -57,7 +57,7 @@ copy. Nothing has to be deployed for a new viewer.
 
 **On a management server (shared mode).** One hub for everyone; viewers reach
 it with `ssh -L 3100:127.0.0.1:3100 you@hub-host` and open
-`http://localhost:3100`. Tunnels are systemd units (`hub/install-tunnels.sh`).
+`http://127.0.0.1:3100`. Tunnels are systemd units (`hub/install-tunnels.sh`).
 Use this when you'd rather the agent keys lived on one hardened box than on
 several laptops — see the trade-off in [`docs/SECURITY.md`](docs/SECURITY.md).
 
@@ -80,8 +80,11 @@ overview table.
 
 | Machine | What you install | What it does |
 |---|---|---|
-| Each monitored server | **agent** — `bash setup.sh agent` | ~65 MB Node process on `127.0.0.1:3001`. No UI, no build, no open ports, **no change to your fail2ban config** |
 | Wherever you want the dashboard — your laptop, or a server | **hub** — `bash setup.sh hub --local` (or `hub`) | Serves the dashboard, holds the agent keys, tunnels out to the fleet |
+| Each monitored server | **agent** — pushed there by `bash hub/enroll.sh user@host` from the hub | ~65 MB Node process on `127.0.0.1:3001`. No UI, no build, no open ports, **no change to your fail2ban config** |
+
+You only ever run commands on the hub machine. `enroll.sh` does the server-side
+work over SSH; `setup.sh agent` exists for installing one by hand.
 
 Adding a server that **already runs fail2ban** is the common case and needs no
 fail2ban changes at all — its existing jails simply appear. See
@@ -122,41 +125,52 @@ and *A7* for a clean rollback.
 
 ## Quick Start
 
-**1. On each server you want to monitor:**
+Everything here runs on **the machine you want the dashboard on** — your laptop
+is the usual choice. You never log in to a monitored server to install anything.
 
-```bash
-git clone https://github.com/virgotex/fail2ban-dashboard.git /opt/fail2ban-dashboard
-cd /opt/fail2ban-dashboard
-bash setup.sh agent          # API only — no UI is installed here
-# → prints this server's API_SECRET; the hub needs it
-```
-
-Plus the sudo rule and systemd unit from [`DEPLOY.md`](DEPLOY.md) Part A.
-
-**2. On the machine you want the dashboard on** — your own laptop, or a
-management server (see *Where does the hub run?* above):
+**1. Set up the hub:**
 
 ```bash
 git clone https://github.com/virgotex/fail2ban-dashboard.git
 cd fail2ban-dashboard
 bash setup.sh hub --local    # generates the hub key, builds the UI
+```
 
-nano hub/servers.json        # one entry per agent: tunnel port, its API_SECRET, ssh
-                             # target — and DELETE any entry you don't use
-ssh -o BatchMode=yes youruser@SERVER_IP true    # must not prompt for a password
+**2. Enroll each server you want to monitor** — one command per server, run from
+here, doing everything over SSH:
+
+```bash
+bash hub/enroll.sh --dry-run youruser@SERVER_IP    # pre-flight, changes nothing
+bash hub/enroll.sh youruser@SERVER_IP              # install + register
+```
+
+It pre-flights the box, installs the agent and its service, grants it scoped
+`sudo` for `fail2ban-client`, verifies it answers, and registers it in
+`hub/servers.json` on the next free port — copying that agent's key across
+directly, so the two can't disagree. Re-run it any time to update a server.
+
+Two prerequisites per server: passwordless SSH (`ssh-copy-id youruser@SERVER_IP`),
+and the hub's IP in that server's fail2ban `ignoreip` — otherwise the tool that
+watches fail2ban eventually gets banned by it. See [`DEPLOY.md`](DEPLOY.md)
+*Step 0*.
+
+**3. Start it and open the dashboard:**
+
+```bash
 cd hub && npm start          # opens the tunnels and serves the dashboard
 ```
 
-**3. Open http://127.0.0.1:3100.** Not `localhost` — that can resolve to `::1`
-and hit a stray `ssh -L` forward instead of the hub. A local hub needs no
-`ssh -L` of its own.
+**http://127.0.0.1:3100** — not `localhost`, which can resolve to `::1` and hit a
+stray `ssh -L` forward instead of the hub. A local hub needs no `ssh -L` of its
+own.
 
 On a shared hub instead, drop `--local`, run
 `sudo TUNNEL_USER=$USER bash hub/install-tunnels.sh` for systemd tunnels, and
 viewers reach it with `ssh -L 3100:127.0.0.1:3100 you@HUB_HOST`.
 
-`setup.sh` is the bootstrap, not the deployment — for systemd units, the sudo
-rules the agent needs, and host hardening, follow [`DEPLOY.md`](DEPLOY.md).
+Prefer to install an agent by hand, or want to know exactly what `enroll.sh` does
+to a production box? [`DEPLOY.md`](DEPLOY.md) Part A documents every step it
+automates.
 
 ---
 
@@ -175,6 +189,7 @@ fail2ban-dashboard/
 │   ├── src/
 │   │   ├── hub.js             # Registry, fan-out, allowlisted proxy, serves the SPA
 │   │   └── mapLimit.js        # Bounded-concurrency fan-out
+│   ├── enroll.sh              # Install + register a server, over SSH, in one command
 │   ├── servers.example.json   # Agent registry (copy to servers.json — holds secrets)
 │   ├── install-tunnels.sh     # systemd SSH tunnels to every agent
 │   ├── .env.example
@@ -254,7 +269,15 @@ cd frontend && npm run dev        # → http://localhost:5173
 
 # Production build (this is what the hub serves)
 cd frontend && npm run build
+
+# Tests — the log parsers, against real fixture files. No fail2ban needed.
+cd backend && npm test
 ```
+
+The tests cover the surface where what the code sees depends on the filesystem:
+logrotate having moved history into `fail2ban.log.1`, an archive being gzipped, a
+byte budget slicing a line in half, and the level/text filters. CI runs them on
+every branch.
 
 ---
 

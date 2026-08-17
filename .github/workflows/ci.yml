@@ -1,10 +1,10 @@
 name: CI
 
 on:
+  # Every branch, not just main — a feature branch is exactly where a regression
+  # should be caught, and this repo's work happens on branches before merging.
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   lint-and-build:
@@ -47,6 +47,12 @@ jobs:
           node -e "require('./src/cache.js')"
           node --check src/server.js
 
+      # The log parsers are the agent's most bug-prone surface: what they see
+      # depends on logrotate, gzip and byte budgets. These run against real
+      # fixture files, no fail2ban daemon needed.
+      - name: Log parsing tests
+        run: cd backend && npm test
+
       - name: Hub parses
         run: |
           cd hub
@@ -54,7 +60,7 @@ jobs:
           node --check src/mapLimit.js
 
       - name: Shell scripts parse
-        run: bash -n setup.sh && bash -n hub/install-tunnels.sh
+        run: bash -n setup.sh && bash -n hub/install-tunnels.sh && bash -n hub/enroll.sh
 
       - name: Cache coalescing behaves
         run: |

@@ -27,6 +27,14 @@ const AUTH_MAX_BYTES = parseInt(process.env.AUTH_MAX_BYTES || String(5 * 1024 * 
 // busy host writes well past LOG_MAX_BYTES in a week, so they get their own
 // (larger) ceiling. Read at most once per LOG_CACHE_TTL_MS.
 const HISTORY_MAX_BYTES = parseInt(process.env.HISTORY_MAX_BYTES || String(16 * 1024 * 1024), 10);
+// System logs consulted (in addition to fail2ban.log) when investigating an IP,
+// for the usernames and ports it tried. Unreadable ones are skipped silently —
+// they need the agent user in `adm`. Override for a distro that puts them
+// elsewhere, or to switch the feature off with a single empty value.
+const AUTH_LOG_PATHS = (process.env.AUTH_LOG_PATHS !== undefined
+  ? process.env.AUTH_LOG_PATHS.split(',')
+  : ['/var/log/auth.log', '/var/log/secure' /* RHEL/CentOS */, '/var/log/syslog']
+).map(p => p.trim()).filter(Boolean);
 // Use sudo so the process doesn't need to run as root.
 // The sudoers rule in docs/SECURITY.md scopes this to fail2ban-client only.
 const USE_SUDO = process.env.USE_SUDO !== 'false';
@@ -388,12 +396,7 @@ async function getIPDetails(ip) {
   if (!validateIP(ip)) throw new Error('Invalid IP address');
 
   // Logs to scan — fail2ban.log first, then auth/syslog if readable
-  const LOG_PATHS = [
-    LOG_PATH,
-    '/var/log/auth.log',
-    '/var/log/secure',          // RHEL/CentOS equivalent
-    '/var/log/syslog',
-  ].filter(p => {
+  const LOG_PATHS = [LOG_PATH, ...AUTH_LOG_PATHS].filter(p => {
     try { fs.accessSync(p, fs.constants.R_OK); return true; } catch { return false; }
   });
 
