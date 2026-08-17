@@ -1,46 +1,44 @@
 /**
- * useApi.js — thin fetch wrapper
+ * useApi.js — thin fetch wrapper. The dashboard talks to ONE thing: the hub.
  *
- * Two auth modes are supported, selected by the backend:
- *   - 'apikey' (dev / single-user): X-API-Key header is sent on every call;
- *     WebSocket auth is the API key via Sec-WebSocket-Protocol.
- *   - 'oidc'   (production): the session cookie travels automatically;
- *     no header is sent. WebSocket auth uses a short-lived ticket obtained
- *     via POST /api/ws-ticket.
+ * The hub is the only web-facing service in this architecture. Agents run on
+ * the monitored servers with no UI, and the browser never contacts them
+ * directly — every server-scoped call goes to /api/servers/<id>/… and the hub
+ * proxies it to that agent using the agent's own key, held server-side.
  *
- * On a 401 with `login` in the response body, the SPA navigates to that URL
- * to trigger the OIDC redirect flow.
+ * Auth: X-API-Key carries HUB_API_SECRET, baked into this bundle at build
+ * time. Whoever can load the page holds it — the hub is meant to be reached
+ * over an SSH tunnel, not published.
+ *
+ * There is no WebSocket. Live updates are polled, so that N open tabs cost the
+ * fleet a bounded, shared number of queries: the hub caches and coalesces its
+ * fan-out, and each agent caches its own fail2ban reads.
  */
 
-const API_KEY = import.meta.env.VITE_API_KEY || 'dev_secret_change_me'
+const API_KEY = import.meta.env.VITE_API_KEY || 'dev_hub_secret_change_me'
 const BASE    = '/api'
-const WS_SUBPROTOCOL = 'fail2ban-api-key'
 
-// Auth mode is discovered once at boot via /api/auth/me.
-let _authMode = 'apikey'
-export function setAuthMode(mode) { _authMode = (mode === 'oidc') ? 'oidc' : 'apikey' }
-export function getAuthMode() { return _authMode }
+let _serverId = null       // which server the server-scoped calls target
+
+export function setServer(id) { _serverId = id || null }
+export function getServer()   { return _serverId }
+
+// Server-scoped paths always route through the hub. Calling one with no server
+// selected is a caller bug, not a request worth sending.
+function scoped(path) {
+  if (!_serverId) throw new Error('No server selected')
+  return `/servers/${encodeURIComponent(_serverId)}${path}`
+}
 
 async function apiFetch(path, options = {}) {
   const headers = {
     'Content-Type': 'application/json',
+    'X-API-Key': API_KEY,
     ...(options.headers || {}),
   }
-  if (_authMode === 'apikey') headers['X-API-Key'] = API_KEY
 
-  const res = await fetch(`${BASE}${path}`, {
-    credentials: 'same-origin',
-    ...options,
-    headers,
-  })
+  const res = await fetch(`${BASE}${path}`, { credentials: 'same-origin', ...options, headers })
 
-  if (res.status === 401) {
-    const body = await res.json().catch(() => ({}))
-    if (body.login) {
-      window.location.href = body.login
-      throw new Error('Redirecting to login')
-    }
-  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }))
     throw new Error(body.error || `HTTP ${res.status}`)
@@ -49,31 +47,23 @@ async function apiFetch(path, options = {}) {
 }
 
 export const api = {
-  me:        ()              => apiFetch('/auth/me'),
-  status:    ()              => apiFetch('/status'),
-  jails:     ()              => apiFetch('/jails'),
-  jail:      (name)          => apiFetch(`/jails/${encodeURIComponent(name)}`),
-  banIP:     (jail, ip)      => apiFetch(`/jails/${encodeURIComponent(jail)}/ban`,
-                                 { method: 'POST', body: JSON.stringify({ ip }) }),
-  unbanIP:   (jail, ip)      => apiFetch(`/jails/${encodeURIComponent(jail)}/ban/${encodeURIComponent(ip)}`,
-                                 { method: 'DELETE' }),
-  logs:      (filter, level) => apiFetch(`/logs?filter=${encodeURIComponent(filter || '')}&level=${encodeURIComponent(level || '')}`),
-  reports:   ()              => apiFetch('/reports'),
-  config:    ()              => apiFetch('/config'),
-  security:  ()              => apiFetch('/security'),
-  ipDetails: (ip)            => apiFetch(`/ip/${encodeURIComponent(ip)}/details`),
-  ipGeo:     (ip)            => apiFetch(`/ip/${encodeURIComponent(ip)}/geo`),
-  wsTicket:  ()              => apiFetch('/ws-ticket', { method: 'POST' }),
-}
+  // ── hub-level (no server scope) ──
+  mode:      ()              => apiFetch('/mode'),
+  servers:   ()              => apiFetch('/servers'),
+  overview:  ()              => apiFetch('/overview'),
 
-export async function createWebSocket(onMessage, onError) {
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const secret = _authMode === 'oidc'
-    ? (await api.wsTicket()).ticket
-    : API_KEY
-  const ws = new WebSocket(`${proto}//${window.location.host}/ws`, [WS_SUBPROTOCOL, secret])
-  ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)) } catch {} }
-  ws.onerror   = onError
-  ws.onclose   = () => console.log('[WS] Connection closed')
-  return ws
+  // ── server-scoped (proxied by the hub to one agent) ──
+  status:    ()              => apiFetch(scoped('/status')),
+  jails:     ()              => apiFetch(scoped('/jails')),
+  jail:      (name)          => apiFetch(scoped(`/jails/${encodeURIComponent(name)}`)),
+  banIP:     (jail, ip)      => apiFetch(scoped(`/jails/${encodeURIComponent(jail)}/ban`),
+                                 { method: 'POST', body: JSON.stringify({ ip }) }),
+  unbanIP:   (jail, ip)      => apiFetch(scoped(`/jails/${encodeURIComponent(jail)}/ban/${encodeURIComponent(ip)}`),
+                                 { method: 'DELETE' }),
+  logs:      (filter, level) => apiFetch(scoped(`/logs?filter=${encodeURIComponent(filter || '')}&level=${encodeURIComponent(level || '')}`)),
+  reports:   ()              => apiFetch(scoped('/reports')),
+  config:    ()              => apiFetch(scoped('/config')),
+  security:  ()              => apiFetch(scoped('/security')),
+  ipDetails: (ip)            => apiFetch(scoped(`/ip/${encodeURIComponent(ip)}/details`)),
+  ipGeo:     (ip)            => apiFetch(scoped(`/ip/${encodeURIComponent(ip)}/geo`)),
 }

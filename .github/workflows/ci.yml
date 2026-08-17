@@ -19,10 +19,14 @@ jobs:
           cache: 'npm'
           cache-dependency-path: |
             backend/package-lock.json
+            hub/package-lock.json
             frontend/package-lock.json
 
-      - name: Install backend deps
+      - name: Install agent deps
         run: cd backend && npm ci
+
+      - name: Install hub deps
+        run: cd hub && npm ci
 
       - name: Install frontend deps
         run: cd frontend && npm ci
@@ -31,3 +35,60 @@ jobs:
         run: cd frontend && npm run build
         env:
           VITE_API_KEY: ci_placeholder_key
+
+      # The agent must stay headless: no SPA serving, no WebSocket server.
+      # These are the properties the whole architecture rests on, so a stray
+      # re-introduction should fail the build rather than reach a server.
+      - name: Agent stays API-only
+        run: |
+          cd backend
+          ! grep -qE "express\.static|WebSocketServer|express-openid-connect" src/server.js \
+            || { echo "::error::The agent must not serve a SPA, open a WebSocket, or use OIDC"; exit 1; }
+          node -e "require('./src/cache.js')"
+          node --check src/server.js
+
+      - name: Hub parses
+        run: |
+          cd hub
+          node --check src/hub.js
+          node --check src/mapLimit.js
+
+      - name: Shell scripts parse
+        run: bash -n setup.sh && bash -n hub/install-tunnels.sh
+
+      - name: Cache coalescing behaves
+        run: |
+          cd backend
+          node -e "
+            const { cached, invalidate } = require('./src/cache');
+            let calls = 0;
+            const slow = () => new Promise(r => setTimeout(() => { calls++; r(calls); }, 20));
+            (async () => {
+              await Promise.all(Array.from({ length: 20 }, () => cached('k', 1000, slow)));
+              if (calls !== 1) throw new Error('concurrent reads must coalesce, got ' + calls);
+              await cached('k', 1000, slow);
+              if (calls !== 1) throw new Error('within TTL must hit cache, got ' + calls);
+              invalidate('k');
+              await cached('k', 1000, slow);
+              if (calls !== 2) throw new Error('invalidate must force a refetch, got ' + calls);
+              console.log('cache ok');
+            })();
+          "
+
+      - name: Fan-out stays bounded
+        run: |
+          cd hub
+          node -e "
+            const { mapLimit } = require('./src/mapLimit');
+            (async () => {
+              let live = 0, peak = 0;
+              const out = await mapLimit([...Array(40).keys()], 4, async n => {
+                live++; peak = Math.max(peak, live);
+                await new Promise(r => setTimeout(r, 2));
+                live--; return n * 2;
+              });
+              if (peak > 4) throw new Error('concurrency exceeded limit: ' + peak);
+              if (!out.every((v, i) => v === i * 2)) throw new Error('results out of order');
+              console.log('fan-out ok');
+            })();
+          "

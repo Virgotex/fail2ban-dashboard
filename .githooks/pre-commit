@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# pre-commit — refuse to commit secrets.
+#
+# .gitignore already excludes servers.json and the .env files, but a `git add -f`,
+# a rename, or a key pasted into a doc would sail straight past it. This is the
+# second lock: it inspects what is actually staged.
+#
+# Enable it once per clone:
+#   git config core.hooksPath .githooks
+# (setup.sh does this for you.)
+#
+# To bypass deliberately:  git commit --no-verify
+set -uo pipefail
+
+RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+fail=0
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+# ── 1. Files that must never be committed, whatever they're called ───────────
+while IFS= read -r f; do
+  case "$(basename "$f")" in
+    servers.json|.env|.env.local)
+      echo -e "${RED}✗ $f holds live secrets (agent keys / API secrets) — not committing.${NC}"
+      echo    "  If this is genuinely an example, name it *.example.json / .env.example."
+      fail=1
+      ;;
+  esac
+  case "$f" in
+    *.pem|*id_rsa*|*id_ed25519*|*.p12|*.pfx)
+      echo -e "${RED}✗ $f looks like private key material — not committing.${NC}"
+      fail=1
+      ;;
+    frontend/dist/*)
+      echo -e "${RED}✗ $f is a build artifact — and the bundle has HUB_API_SECRET baked in.${NC}"
+      fail=1
+      ;;
+  esac
+done <<< "$staged"
+
+# ── 2. Secret-shaped content in the staged diff ──────────────────────────────
+# 32+ hex chars is the shape of every key this project generates. The
+# placeholders in the example files are deliberately not hex.
+added=$(git diff --cached --unified=0 -- . ':!*package-lock.json' ':!*.svg' | grep '^+' || true)
+
+if echo "$added" | grep -qiE '^\+.*\b[0-9a-f]{32,}\b'; then
+  hits=$(echo "$added" | grep -inE '^\+.*\b[0-9a-f]{32,}\b' | grep -viE 'change_this|PASTE_|placeholder|randomBytes|integrity|sha512|sha1-' | head -5)
+  if [ -n "$hits" ]; then
+    echo -e "${RED}✗ Staged changes contain a 32+ character hex string — that's the shape of an API key:${NC}"
+    echo "$hits" | sed 's/^/    /'
+    fail=1
+  fi
+fi
+
+if echo "$added" | grep -qE 'BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY'; then
+  echo -e "${RED}✗ Staged changes contain a private key block.${NC}"
+  fail=1
+fi
+
+# An apiKey with a real-looking value (not a placeholder) in any staged file.
+if echo "$added" | grep -qE '"apiKey"[[:space:]]*:[[:space:]]*"[^"<]{16,}"'; then
+  if ! echo "$added" | grep -E '"apiKey"[[:space:]]*:[[:space:]]*"[^"<]{16,}"' | grep -qiE 'PASTE_|change_this|example'; then
+    echo -e "${RED}✗ Staged changes set \"apiKey\" to what looks like a real value.${NC}"
+    fail=1
+  fi
+fi
+
+if [ "$fail" = 1 ]; then
+  echo ""
+  echo -e "${YELLOW}Nothing was committed.${NC} Unstage the offending file with:"
+  echo "    git restore --staged <file>"
+  echo "If a secret has already been pushed, rotate it — removing it from git is not enough."
+  exit 1
+fi
+
+exit 0

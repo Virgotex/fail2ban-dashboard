@@ -1,7 +1,7 @@
 {
-  "name": "fail2ban-dashboard-backend",
-  "version": "1.0.0",
-  "description": "Secure backend API for Fail2Ban Dashboard",
+  "name": "fail2ban-dashboard-agent",
+  "version": "2.0.0",
+  "description": "Fail2Ban Dashboard agent — API-only service that runs on each monitored server",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
@@ -9,13 +9,10 @@
   },
   "dependencies": {
     "express": "^4.21.1",
-    "cors": "^2.8.5",
     "helmet": "^7.1.0",
     "express-rate-limit": "^7.1.5",
-    "ws": "^8.21.0",
     "dotenv": "^16.3.1",
     "express-validator": "^7.0.1",
-    "express-openid-connect": "^2.17.1",
     "morgan": "^1.10.0"
   },
   "devDependencies": {

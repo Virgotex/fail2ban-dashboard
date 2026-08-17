@@ -13,6 +13,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const zlib = require('zlib');
 
 const LOG_PATH      = process.env.FAIL2BAN_LOG   || '/var/log/fail2ban.log';
 const LOG_MAX_LINES = parseInt(process.env.LOG_MAX_LINES || '500', 10);
@@ -21,19 +22,92 @@ const LOG_MAX_LINES = parseInt(process.env.LOG_MAX_LINES || '500', 10);
 // noisy boxes. 2 MB is ~10k average lines, well above LOG_MAX_LINES.
 const LOG_MAX_BYTES  = parseInt(process.env.LOG_MAX_BYTES  || String(2 * 1024 * 1024), 10);
 const AUTH_MAX_BYTES = parseInt(process.env.AUTH_MAX_BYTES || String(5 * 1024 * 1024), 10);
+// History budget for the features that look backwards in time — the 7-day
+// trend, per-jail totals and an IP's timeline. These span rotated files, and a
+// busy host writes well past LOG_MAX_BYTES in a week, so they get their own
+// (larger) ceiling. Read at most once per LOG_CACHE_TTL_MS.
+const HISTORY_MAX_BYTES = parseInt(process.env.HISTORY_MAX_BYTES || String(16 * 1024 * 1024), 10);
 // Use sudo so the process doesn't need to run as root.
 // The sudoers rule in docs/SECURITY.md scopes this to fail2ban-client only.
 const USE_SUDO = process.env.USE_SUDO !== 'false';
 
-// Return a readline interface over the LAST `maxBytes` of `filePath`. If the
-// file is bigger than maxBytes the very first emitted line is the tail end
-// of a line we sliced through — the caller should drop it.
-function tailReader(filePath, maxBytes) {
-  const stat = fs.statSync(filePath);
-  const start = Math.max(0, stat.size - maxBytes);
-  const stream = fs.createReadStream(filePath, { encoding: 'utf8', start });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  return { rl, sliced: start > 0 };
+// ─── Log reading ──────────────────────────────────────────────────────────
+// Reads are always bounded to the tail: fail2ban.log grows fast on a noisy box
+// and the agent must not starve the host it's monitoring. Where a line is
+// sliced through by the byte budget, the first line read is a fragment and gets
+// dropped.
+//
+// logrotate moves history out from under us. Minutes after a rotation the live
+// fail2ban.log holds a handful of lines, so everything derived from it — the
+// 7-day trend, per-jail totals, an IP's history — reads as zero while the bans
+// that produced it sit in fail2ban.log.1. Include the rotated siblings too,
+// newest first, until `maxBytes` is spent.
+//
+// `sinceMs`, when given, drops archives whose last write predates it: a file
+// not touched since then holds nothing inside the window, so decompressing it
+// would be pure waste.
+//
+// Returns [{ file, gz, size, takeBytes }] OLDEST FIRST, so a caller that walks
+// them in order sees lines chronologically.
+function logSources(filePath, maxBytes, sinceMs = 0) {
+  const statOf = f => { try { return fs.statSync(f); } catch { return null; } };
+  const liveStat = statOf(filePath);
+  if (!liveStat) return [];
+
+  const dir  = path.dirname(filePath);
+  const base = path.basename(filePath);
+
+  // logrotate produces either numeric suffixes (fail2ban.log.1[.gz]) or dates
+  // (fail2ban.log-20260816[.gz]) depending on `dateext`. Ordering by mtime
+  // covers both without having to parse either convention.
+  let rotated = [];
+  try {
+    rotated = fs.readdirSync(dir)
+      .filter(n => n !== base && (n.startsWith(`${base}.`) || n.startsWith(`${base}-`)))
+      .map((n) => { const file = path.join(dir, n); return { file, st: statOf(file) }; })
+      .filter(x => x.st && x.st.isFile() && x.st.mtimeMs >= sinceMs)
+      .sort((a, b) => b.st.mtimeMs - a.st.mtimeMs);
+  } catch { /* directory unreadable — the live file alone is still useful */ }
+
+  const chosen = [];
+  let budget = maxBytes;
+  for (const { file, st } of [{ file: filePath, st: liveStat }, ...rotated]) {
+    if (budget <= 0) break;
+    const gz = /\.gz$/.test(file);
+    // takeBytes is what's left of the budget when this file is reached, so an
+    // oversized file is tail-sliced rather than read whole.
+    chosen.push({ file, gz, size: st.size, takeBytes: budget });
+    // Text compresses ~10x; charging a gzipped log at 10x its on-disk size
+    // stops one archive from consuming an unbounded amount of the budget.
+    budget -= gz ? st.size * 10 : st.size;
+  }
+  return chosen.reverse();
+}
+
+// Feed every line of `filePath` plus as much rotated history as `maxBytes`
+// allows to `onLine`, oldest first. A single unreadable or truncated archive is
+// skipped rather than failing the whole read.
+async function readLines(filePath, maxBytes, onLine, sinceMs = 0) {
+  for (const src of logSources(filePath, maxBytes, sinceMs)) {
+    // gzip isn't seekable, so an archive is read whole; only plain files can be
+    // tail-sliced. Sizes come from logSources — no second stat per file.
+    const start = src.gz ? 0 : Math.max(0, src.size - src.takeBytes);
+    const input = src.gz
+      ? fs.createReadStream(src.file).pipe(zlib.createGunzip())
+      : fs.createReadStream(src.file, { encoding: 'utf8', start });
+
+    await new Promise((resolve) => {
+      const rl = readline.createInterface({ input, crlfDelay: Infinity });
+      let dropFirst = start > 0;
+      rl.on('line', (line) => {
+        if (dropFirst) { dropFirst = false; return; }
+        onLine(line);
+      });
+      rl.on('close', resolve);
+      rl.on('error', resolve);
+      input.on('error', resolve);
+    });
+  }
 }
 
 // ─── Strict IP/CIDR validator ──────────────────────────────────────────────
@@ -172,45 +246,46 @@ async function isIPBanned(jailName, ip) {
  * Returns up to LOG_MAX_LINES recent lines, newest first.
  */
 async function getLogs(filterText = '', level = '') {
-  return new Promise((resolve, reject) => {
-    if (!fs.existsSync(LOG_PATH)) {
-      return resolve([]);
+  if (!fs.existsSync(LOG_PATH)) return [];
+
+  const lines = [];
+  // Hoisted out of the per-line callback: this runs over every line of a
+  // multi-megabyte window, so lowercasing the (constant) filter per line — or
+  // the line itself when nothing needs it — is pure waste.
+  const ft = filterText.toLowerCase();
+  // fail2ban writes "NOTICE  [sshd] Ban 1.2.3.4" — the event follows the jail,
+  // it isn't a "[ban]" tag. Matching "[ban]" filtered out every line.
+  const levelNeedle = { BAN: '] ban ', UNBAN: '] unban ', WARNING: 'warning' }[level] || '';
+  const needsLower  = Boolean(ft || levelNeedle);
+
+  // Spans rotated files: right after a rotation the live log may hold only a
+  // few lines, and "recent activity" that stops at the rotation boundary is
+  // indistinguishable from a quiet server.
+  await readLines(LOG_PATH, LOG_MAX_BYTES, (line) => {
+    if (!line.trim()) return;
+
+    if (needsLower) {
+      const lower = line.toLowerCase();
+      if (ft && !lower.includes(ft)) return;
+      if (levelNeedle && !lower.includes(levelNeedle)) return;
     }
 
-    const lines = [];
-    const { rl, sliced } = tailReader(LOG_PATH, LOG_MAX_BYTES);
-    let dropFirst = sliced;
-
-    rl.on('line', (line) => {
-      if (dropFirst) { dropFirst = false; return; }
-      if (!line.trim()) return;
-
-      const lower = line.toLowerCase();
-      const ft = filterText.toLowerCase();
-
-      if (ft && !lower.includes(ft)) return;
-      if (level === 'BAN'   && !lower.includes('[ban]'))   return;
-      if (level === 'UNBAN' && !lower.includes('[unban]')) return;
-      if (level === 'WARNING' && !lower.includes('warning')) return;
-
-      // Parse line: "2024-05-12 09:14:22,123 fail2ban.actions [1234]: BAN [sshd] ..."
-      const m = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+\S+\s+\[(\d+)\]:\s+(WARNING|NOTICE|INFO|DEBUG|ERROR|CRITICAL)\s+(.*)/);
-      if (m) {
-        lines.push({
-          timestamp: m[1],
-          pid:       m[2],
-          level:     m[3],
-          message:   m[4],
-          raw:       line,
-        });
-      } else {
-        lines.push({ timestamp: null, level: 'INFO', message: line, raw: line });
-      }
-    });
-
-    rl.on('close', () => resolve(lines.slice(-LOG_MAX_LINES).reverse()));
-    rl.on('error', reject);
+    // Parse line: "2024-05-12 09:14:22,123 fail2ban.actions [1234]: NOTICE [sshd] Ban …"
+    const m = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+\S+\s+\[(\d+)\]:\s+(WARNING|NOTICE|INFO|DEBUG|ERROR|CRITICAL)\s+(.*)/);
+    if (m) {
+      lines.push({
+        timestamp: m[1],
+        pid:       m[2],
+        level:     m[3],
+        message:   m[4],
+        raw:       line,
+      });
+    } else {
+      lines.push({ timestamp: null, level: 'INFO', message: line, raw: line });
+    }
   });
+
+  return lines.slice(-LOG_MAX_LINES).reverse();
 }
 
 /**
@@ -226,81 +301,79 @@ async function getGlobalConfig() {
 }
 
 /**
- * Parse the fail2ban log to produce chart-ready report data:
- *   - bans per day for the last 7 days
- *   - bans per jail (all time from log)
+ * Parse the fail2ban log to produce chart-ready report data, covering the last
+ * 7 days — which is what the UI labels these as, and what bounds the read:
+ *   - bans per day
+ *   - bans per jail
  *   - recent ban events with IP + jail
+ *
+ * Rotated and gzipped logs are included; archives untouched since the window
+ * opened are skipped unread.
  *
  * This is all derived from YOUR actual log file — zero mock data.
  */
 async function getReports() {
-  return new Promise((resolve, reject) => {
-    if (!fs.existsSync(LOG_PATH)) {
-      return resolve({ dailyBans: [], byJail: [], recentBans: [] });
+  if (!fs.existsSync(LOG_PATH)) {
+    return { dailyBans: [], byJail: [], recentBans: [] };
+  }
+
+  // We'll count bans per day (last 7 days) and per jail
+  const dailyMap  = {};   // 'YYYY-MM-DD' -> count
+  const jailMap   = {};   // jailName -> count
+  const recentBans = [];  // [{timestamp, jail, ip}]
+
+  // Build the last-7-days date keys so days with zero bans still appear
+  const today = new Date();
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const key = d.toISOString().slice(0, 10);
+    dailyMap[key] = 0;
+  }
+
+  // Matches lines like:
+  // 2025-05-12 09:14:22,123 fail2ban.actions [1234]: NOTICE  [sshd] Ban 185.220.101.45
+  const BAN_RE = /^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2},\d+\s+\S+\s+\[\d+\]:\s+\w+\s+\[([^\]]+)\] Ban ([\d.:a-fA-F]+)/;
+
+  // HISTORY_MAX_BYTES, not LOG_MAX_BYTES: a seven-day trend has to be able to
+  // see seven days, which on a busy host is more than the live-log budget and,
+  // after a rotation, is not in the live log at all. Archives untouched since
+  // the window opened are skipped, so a long retention policy costs nothing
+  // here — byJail is "all time" within what that leaves.
+  const windowStart = Date.parse(`${Object.keys(dailyMap)[0]}T00:00:00Z`);
+  await readLines(LOG_PATH, HISTORY_MAX_BYTES, (line) => {
+    const m = line.match(BAN_RE);
+    if (!m) return;
+
+    const [, dateStr, jail, ip] = m;
+
+    // Per-jail totals (all time in the window we read)
+    jailMap[jail] = (jailMap[jail] || 0) + 1;
+
+    // Per-day (only last 7 days)
+    if (Object.prototype.hasOwnProperty.call(dailyMap, dateStr)) {
+      dailyMap[dateStr]++;
     }
 
-    // We'll count bans per day (last 7 days) and per jail
-    const dailyMap  = {};   // 'YYYY-MM-DD' -> count
-    const jailMap   = {};   // jailName -> count
-    const recentBans = [];  // [{timestamp, jail, ip}]
+    // Collect every ban in the window; we slice the newest 50 at the end.
+    // (Capping here would keep the *oldest* 50 in the tail window, not the
+    // most recent — the opposite of what "recent bans" should show.)
+    recentBans.push({ date: dateStr, jail, ip });
+  }, windowStart);
 
-    // Build the last-7-days date keys so days with zero bans still appear
-    const today = new Date();
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(today);
-      d.setDate(d.getDate() - i);
-      const key = d.toISOString().slice(0, 10);
-      dailyMap[key] = 0;
-    }
-    const sevenDaysAgo = new Date(today);
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+  const dailyBans = Object.entries(dailyMap).map(([date, bans]) => ({
+    // Short label like "Mon" or "12/05"
+    day: new Date(date + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'short' }),
+    date,
+    bans,
+  }));
 
-    // Matches lines like:
-    // 2025-05-12 09:14:22,123 fail2ban.actions [1234]: NOTICE  [sshd] Ban 185.220.101.45
-    const BAN_RE = /^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2},\d+\s+\S+\s+\[\d+\]:\s+\w+\s+\[([^\]]+)\] Ban ([\d.:a-fA-F]+)/;
+  const byJail = Object.entries(jailMap)
+    .map(([name, bans]) => ({ name, bans }))
+    .sort((a, b) => b.bans - a.bans);
 
-    const { rl, sliced } = tailReader(LOG_PATH, LOG_MAX_BYTES);
-    let dropFirst = sliced;
-
-    rl.on('line', (line) => {
-      if (dropFirst) { dropFirst = false; return; }
-      const m = line.match(BAN_RE);
-      if (!m) return;
-
-      const [, dateStr, jail, ip] = m;
-
-      // Per-jail totals (all time in log)
-      jailMap[jail] = (jailMap[jail] || 0) + 1;
-
-      // Per-day (only last 7 days)
-      if (dailyMap.hasOwnProperty(dateStr)) {
-        dailyMap[dateStr]++;
-      }
-
-      // Collect every ban in the window; we slice the newest 50 at the end.
-      // (Capping here would keep the *oldest* 50 in the tail window, not the
-      // most recent — the opposite of what "recent bans" should show.)
-      recentBans.push({ date: dateStr, jail, ip });
-    });
-
-    rl.on('close', () => {
-      const dailyBans = Object.entries(dailyMap).map(([date, bans]) => ({
-        // Short label like "Mon" or "12/05"
-        day: new Date(date + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'short' }),
-        date,
-        bans,
-      }));
-
-      const byJail = Object.entries(jailMap)
-        .map(([name, bans]) => ({ name, bans }))
-        .sort((a, b) => b.bans - a.bans);
-
-      // Newest 50, most-recent first.
-      resolve({ dailyBans, byJail, recentBans: recentBans.slice(-50).reverse() });
-    });
-
-    rl.on('error', reject);
-  });
+  // Newest 50, most-recent first.
+  return { dailyBans, byJail, recentBans: recentBans.slice(-50).reverse() };
 }
 
 /**
@@ -344,90 +417,89 @@ async function getIPDetails(ip) {
   const AUTH_PORT  = /port\s+(\d+)/;
   const AUTH_METH  = /(?:ssh2|publickey|password|keyboard-interactive)/i;
 
+  // The agent's own HTTP access log reaches syslog via journald, so
+  // investigating an IP logs a request containing that IP — which would then
+  // come back as "evidence" about it. Drop our own API traffic.
+  const SELF_NOISE = /"(?:GET|POST|PUT|PATCH|DELETE)\s+\/api\//;
+
   for (const logPath of LOG_PATHS) {
     const isFail2ban = logPath === LOG_PATH;
 
-    await new Promise((resolve) => {
-      const { rl, sliced } = tailReader(logPath, isFail2ban ? LOG_MAX_BYTES : AUTH_MAX_BYTES);
-      let dropFirst = sliced;
+    // Spans rotated/gzipped files: a ban from before the last rotation is
+    // exactly the history an investigation is for.
+    await readLines(logPath, isFail2ban ? HISTORY_MAX_BYTES : AUTH_MAX_BYTES, (line) => {
+      if (!line.includes(ip)) return;  // fast pre-filter
+      if (SELF_NOISE.test(line)) return;
 
-      rl.on('line', (line) => {
-        if (dropFirst) { dropFirst = false; return; }
-        if (!line.includes(ip)) return;  // fast pre-filter
+      // Extract timestamp
+      let timestamp = null;
+      const tsMatch = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+      if (tsMatch) timestamp = tsMatch[1];
+      // Auth log format: "May 12 09:14:22"
+      const authTs = line.match(/^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})/);
+      if (!timestamp && authTs) timestamp = authTs[1];
 
-        // Extract timestamp
-        let timestamp = null;
-        const tsMatch = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
-        if (tsMatch) timestamp = tsMatch[1];
-        // Auth log format: "May 12 09:14:22"
-        const authTs = line.match(/^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})/);
-        if (!timestamp && authTs) timestamp = authTs[1];
+      if (timestamp) {
+        if (!firstSeen) firstSeen = timestamp;
+        lastSeen = timestamp;
+      }
 
-        if (timestamp) {
-          if (!firstSeen) firstSeen = timestamp;
-          lastSeen = timestamp;
-        }
+      if (isFail2ban) {
+        let type = 'info';
+        let jail = null;
+        let detail = '';
 
-        if (isFail2ban) {
-          let type = 'info';
-          let jail = null;
-          let detail = '';
+        const banMatch   = line.match(F2B_BAN);
+        const unbanMatch = line.match(F2B_UNBAN);
+        const foundMatch = line.match(F2B_FOUND);
 
-          const banMatch   = line.match(F2B_BAN);
-          const unbanMatch = line.match(F2B_UNBAN);
-          const foundMatch = line.match(F2B_FOUND);
-
-          if (banMatch) {
-            type  = 'ban';
-            jail  = banMatch[1];
-            detail = `Banned in jail [${jail}]`;
-            jailsHit[jail] = jailsHit[jail] || { bans: 0, unbans: 0, attempts: 0 };
-            jailsHit[jail].bans++;
-          } else if (unbanMatch) {
-            type   = 'unban';
-            jail   = unbanMatch[1];
-            detail = `Unbanned from jail [${jail}]`;
-            jailsHit[jail] = jailsHit[jail] || { bans: 0, unbans: 0, attempts: 0 };
-            jailsHit[jail].unbans++;
-          } else if (foundMatch) {
-            type   = 'attempt';
-            jail   = foundMatch[1];
-            detail = `Trigger detected in jail [${jail}]`;
-            jailsHit[jail] = jailsHit[jail] || { bans: 0, unbans: 0, attempts: 0 };
-            jailsHit[jail].attempts++;
-          } else {
-            detail = line.replace(/^\S+\s+\S+\s+\[\d+\]:\s+\w+\s+/, '').trim();
-          }
-
-          timeline.push({ timestamp, type, source: 'fail2ban', jail, detail, raw: line });
-
+        if (banMatch) {
+          type  = 'ban';
+          jail  = banMatch[1];
+          detail = `Banned in jail [${jail}]`;
+          jailsHit[jail] = jailsHit[jail] || { bans: 0, unbans: 0, attempts: 0 };
+          jailsHit[jail].bans++;
+        } else if (unbanMatch) {
+          type   = 'unban';
+          jail   = unbanMatch[1];
+          detail = `Unbanned from jail [${jail}]`;
+          jailsHit[jail] = jailsHit[jail] || { bans: 0, unbans: 0, attempts: 0 };
+          jailsHit[jail].unbans++;
+        } else if (foundMatch) {
+          type   = 'attempt';
+          jail   = foundMatch[1];
+          detail = `Trigger detected in jail [${jail}]`;
+          jailsHit[jail] = jailsHit[jail] || { bans: 0, unbans: 0, attempts: 0 };
+          jailsHit[jail].attempts++;
         } else {
-          // Auth/syslog line
-          const userMatch = line.match(AUTH_USER);
-          const portMatch = line.match(AUTH_PORT);
-          const methMatch = line.match(AUTH_METH);
-
-          if (userMatch) usernames.add(userMatch[1]);
-          if (portMatch) ports.add(portMatch[1]);
-
-          let detail = line.replace(/^\w+\s+\d+\s+\S+\s+\S+:\s+/, '').trim();
-          // Truncate very long lines
-          if (detail.length > 200) detail = detail.slice(0, 200) + '…';
-
-          timeline.push({
-            timestamp,
-            type: line.toLowerCase().includes('failed') || line.toLowerCase().includes('invalid') ? 'attempt' : 'info',
-            source: path.basename(logPath),
-            jail: null,
-            detail,
-            raw: line,
-            method: methMatch ? methMatch[0] : null,
-          });
+          detail = line.replace(/^\S+\s+\S+\s+\[\d+\]:\s+\w+\s+/, '').trim();
         }
-      });
 
-      rl.on('close', resolve);
-      rl.on('error', resolve); // don't crash if one log is unreadable
+        timeline.push({ timestamp, type, source: 'fail2ban', jail, detail, raw: line });
+
+      } else {
+        // Auth/syslog line
+        const userMatch = line.match(AUTH_USER);
+        const portMatch = line.match(AUTH_PORT);
+        const methMatch = line.match(AUTH_METH);
+
+        if (userMatch) usernames.add(userMatch[1]);
+        if (portMatch) ports.add(portMatch[1]);
+
+        let detail = line.replace(/^\w+\s+\d+\s+\S+\s+\S+:\s+/, '').trim();
+        // Truncate very long lines
+        if (detail.length > 200) detail = detail.slice(0, 200) + '…';
+
+        timeline.push({
+          timestamp,
+          type: line.toLowerCase().includes('failed') || line.toLowerCase().includes('invalid') ? 'attempt' : 'info',
+          source: path.basename(logPath),
+          jail: null,
+          detail,
+          raw: line,
+          method: methMatch ? methMatch[0] : null,
+        });
+      }
     });
   }
 
