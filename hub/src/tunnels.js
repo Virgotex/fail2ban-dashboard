@@ -158,7 +158,7 @@ class TunnelSupervisor {
   }
 
   #spawn(t) {
-    if (this.stopping) return;
+    if (this.stopping || t.retired || t.child) return;
 
     const args = [
       '-N',                                    // no remote command, just forward
