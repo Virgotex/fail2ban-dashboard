@@ -55,13 +55,7 @@ class TunnelSupervisor {
         this.log(`[tunnel] ${s.id}: baseUrl is not a loopback URL with a port — not managing a tunnel for it`);
         continue;
       }
-      this.tunnels.set(s.id, {
-        id: s.id, target: s.ssh, localPort: port,
-        child: null, timer: null,
-        state: 'stopped',       // stopped | starting | up | down
-        restarts: 0, backoff: BACKOFF_MIN_MS,
-        lastError: null, since: null,
-      });
+      this.tunnels.set(s.id, this.#newEntry(s.id, { target: s.ssh, localPort: port }));
     }
   }
 
@@ -98,6 +92,71 @@ class TunnelSupervisor {
     for (const t of this.tunnels.values()) this.#spawn(t);
   }
 
+  /**
+   * Reconcile against a new registry: start tunnels for added servers, stop
+   * those for removed ones, and restart any whose target or port changed.
+   * Untouched tunnels are left alone — a reload must not interrupt a healthy
+   * connection, or reloading would be worse than the restart it replaces.
+   *
+   * @returns {{added: string[], removed: string[], changed: string[]}}
+   */
+  sync(servers) {
+    const wanted = new Map();
+    for (const s of servers) {
+      if (!s.ssh) continue;
+      const port = this.#localPortOf(s);
+      if (!port) {
+        this.log(`[tunnel] ${s.id}: baseUrl is not a loopback URL with a port — not managing a tunnel for it`);
+        continue;
+      }
+      wanted.set(s.id, { target: s.ssh, localPort: port });
+    }
+
+    const added = [], removed = [], changed = [];
+
+    for (const [id, t] of this.tunnels) {
+      const w = wanted.get(id);
+      if (!w) { this.#retire(t); this.tunnels.delete(id); removed.push(id); }
+      else if (w.target !== t.target || w.localPort !== t.localPort) {
+        this.#retire(t);
+        this.tunnels.set(id, this.#newEntry(id, w));
+        changed.push(id);
+      }
+    }
+
+    for (const [id, w] of wanted) {
+      if (this.tunnels.has(id)) continue;
+      this.tunnels.set(id, this.#newEntry(id, w));
+      added.push(id);
+    }
+
+    for (const id of [...added, ...changed]) {
+      if (!this.stopping) this.#spawn(this.tunnels.get(id));
+    }
+    return { added, removed, changed };
+  }
+
+  #newEntry(id, { target, localPort }) {
+    return {
+      id, target, localPort,
+      child: null, timer: null,
+      state: 'stopped',
+      restarts: 0, backoff: BACKOFF_MIN_MS,
+      lastError: null, since: null,
+    };
+  }
+
+  // Stop one tunnel for good: cancel any pending reconnect first, so a dying
+  // child can't schedule itself back to life after we've let go of it.
+  #retire(t) {
+    t.retired = true;
+    if (t.timer) { clearTimeout(t.timer); t.timer = null; }
+    const child = t.child;
+    t.child = null;
+    t.state = 'stopped';
+    if (child) { try { child.kill('SIGTERM'); } catch { /* already gone */ } }
+  }
+
   #spawn(t) {
     if (this.stopping) return;
 
@@ -127,7 +186,9 @@ class TunnelSupervisor {
     });
 
     child.on('exit', (code, signal) => {
-      if (this.stopping) return;
+      // A retired tunnel's child dying must not schedule a reconnect — that
+      // would resurrect a server we just removed from the registry.
+      if (this.stopping || t.retired) return;
       t.child = null;
       t.state = 'down';
       const wasUpFor = Date.now() - (t.since || Date.now());

@@ -53,11 +53,16 @@ function setMtime(name, isoish) {
   fs.utimesSync(path.join(FIXTURES, name), t, t);
 }
 
-/** 'YYYY-MM-DD' for N days before today — report assertions must not go stale. */
+/**
+ * 'YYYY-MM-DD' for N days before today — report assertions must not go stale.
+ * LOCAL date parts, matching what fail2ban stamps its lines with. Using
+ * toISOString() here would have agreed with the UTC bug it is meant to catch.
+ */
 function daysAgo(n) {
   const d = new Date();
   d.setDate(d.getDate() - n);
-  return d.toISOString().slice(0, 10);
+  const p = x => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 // ─── Rotation: the bug that made every log-derived view read zero ─────────
@@ -125,6 +130,31 @@ test('getReports caps recentBans at the 50 NEWEST bans', async () => {
   assert.equal(r.recentBans.length, 50);
   assert.equal(r.recentBans[0].ip, '10.0.0.59', 'newest first, not the oldest 50');
   assert.equal(r.recentBans.at(-1).ip, '10.0.0.10');
+});
+
+test('getReports buckets days in the host timezone, not UTC', async () => {
+  // The trend was keyed with toISOString(), i.e. UTC, while fail2ban stamps its
+  // lines in local time. For most of the world, for part of every day, that put
+  // today's bans in no bucket at all and they vanished from the chart.
+  const original = process.env.TZ;
+  try {
+    // Kiritimati (UTC+14) and Midway (UTC-11) between them straddle every hour
+    // of the UTC day, so one of them always disagrees with UTC about the date —
+    // whatever time this suite happens to run.
+    for (const tz of ['UTC', 'Pacific/Kiritimati', 'Pacific/Midway', 'Asia/Kolkata']) {
+      process.env.TZ = tz;
+      const today = daysAgo(0);                     // local date, in this tz
+      writeLogs({ 'fail2ban.log': line(today, '00:30:00', 'sshd', 'Ban 10.0.0.9') + '\n' });
+
+      const r = await f2b.getReports();
+      assert.equal(r.dailyBans.at(-1).date, today, `${tz}: today must be the last bucket`);
+      assert.equal(r.dailyBans.at(-1).bans, 1, `${tz}: today's ban must be counted`);
+      assert.equal(r.dailyBans.reduce((s, d) => s + d.bans, 0), 1,
+        `${tz}: counted exactly once, in the right bucket`);
+    }
+  } finally {
+    if (original === undefined) delete process.env.TZ; else process.env.TZ = original;
+  }
 });
 
 // ─── getLogs: filters and rotation ────────────────────────────────────────
@@ -268,6 +298,55 @@ test('getIPDetails harvests usernames and ports from the auth log', async () => 
     'another IP\'s port must not be attributed to this one');
 });
 
+test('getIPDetails timeline is chronological across both log formats', async () => {
+  // fail2ban writes "2026-08-25 10:00:00", syslog writes "Aug 25 09:00:00".
+  // Compared as strings, digits sort before letters, so every auth-log event
+  // landed after every fail2ban one however early it happened — and the
+  // 200-event cap then kept the auth noise and sliced the bans away.
+  const today = new Date();
+  const mon = today.toLocaleString('en-US', { month: 'short' });
+  const day = String(today.getDate()).padStart(2, ' ');
+
+  writeLogs({
+    'fail2ban.log':
+      line(daysAgo(0), '09:30:00', 'sshd', 'Ban 10.0.0.8') + '\n' +
+      line(daysAgo(0), '09:40:00', 'sshd', 'Unban 10.0.0.8') + '\n',
+    'auth.log':
+      `${mon} ${day} 09:00:00 host sshd[1]: Invalid user admin from 10.0.0.8 port 40001\n` +
+      `${mon} ${day} 09:35:00 host sshd[1]: Failed password for root from 10.0.0.8 port 40002 ssh2\n`,
+  });
+
+  const d = await f2b.getIPDetails('10.0.0.8');
+  assert.equal(d.timeline.length, 4);
+  assert.deepEqual(d.timeline.map(e => e.timestamp.slice(-8)),
+    ['09:00:00', '09:30:00', '09:35:00', '09:40:00'],
+    'events interleave by real time, not by which file they came from');
+
+  // The activity window must span the whole thing, not stop at whichever file
+  // was read last.
+  assert.match(d.summary.firstSeen, /09:00:00$/);
+  assert.match(d.summary.lastSeen,  /09:40:00$/);
+});
+
+test('timestampToMs understands both log formats and rejects the rest', () => {
+  const iso = f2b.timestampToMs('2026-08-25 10:00:00');
+  assert.equal(iso, new Date(2026, 7, 25, 10, 0, 0).getTime(), 'fail2ban format, parsed as local');
+
+  // Syslog carries no year: assume the current one...
+  const now = new Date(2026, 7, 25, 12, 0, 0).getTime();
+  assert.equal(f2b.timestampToMs('Aug 25 10:00:00', now),
+    new Date(2026, 7, 25, 10, 0, 0).getTime());
+  // ...unless that would date the event in the future, which is what a December
+  // archive read in January looks like.
+  const january = new Date(2026, 0, 3, 12, 0, 0).getTime();
+  assert.equal(f2b.timestampToMs('Dec 28 23:00:00', january),
+    new Date(2025, 11, 28, 23, 0, 0).getTime(), 'a December line in January is last year');
+
+  for (const bad of [null, '', 'not a timestamp', 'Foo 25 10:00:00', '2026-08-25']) {
+    assert.equal(f2b.timestampToMs(bad), null, `${JSON.stringify(bad)} is not a timestamp`);
+  }
+});
+
 test('getIPDetails rejects anything that is not an IP', async () => {
   writeLogs({ 'fail2ban.log': '' });
   for (const bad of ['not-an-ip', '1.2.3.4; rm -rf /', '999.1.1.1', '']) {
@@ -279,11 +358,16 @@ test('getIPDetails rejects anything that is not an IP', async () => {
 // ─── Validators — the guard in front of every fail2ban-client call ────────
 
 test('validateIP accepts real addresses and CIDRs, rejects the rest', () => {
-  for (const ok of ['1.2.3.4', '10.0.0.0/8', '255.255.255.255', '::1', '2001:db8::1', '2001:db8::/32']) {
+  for (const ok of ['1.2.3.4', '10.0.0.0/8', '255.255.255.255', '0.0.0.0/0',
+                    '::1', '2001:db8::1', '2001:db8::/32', 'fe80::1/128',
+                    ' 1.2.3.4 ' /* trimmed */]) {
     assert.equal(f2b.validateIP(ok), true, `${ok} should be valid`);
   }
   for (const bad of ['256.1.1.1', '1.2.3.4.5', '1.2.3', 'localhost', '1.2.3.4 && id',
-                     '', null, undefined, '../../etc/passwd']) {
+                     '', null, undefined, '../../etc/passwd',
+                     // A hand-rolled IPv6 regex used to wave these through.
+                     ':::', '::::', '1:2:3:4:5:6:7:8:9', 'gggg::1', '2001:db8::/129',
+                     '10.0.0.0/33', '10.0.0.0/8/8', '10.0.0.0/', '10.0.0.0/x']) {
     assert.equal(f2b.validateIP(bad), false, `${JSON.stringify(bad)} should be invalid`);
   }
 });

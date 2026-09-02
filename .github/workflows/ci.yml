@@ -58,6 +58,7 @@ jobs:
           cd hub
           node --check src/hub.js
           node --check src/mapLimit.js
+          node --check src/tunnels.js
 
       - name: Shell scripts parse
         run: bash -n setup.sh && bash -n hub/install-tunnels.sh && bash -n hub/enroll.sh
