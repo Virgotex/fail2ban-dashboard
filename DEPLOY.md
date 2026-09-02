@@ -9,7 +9,7 @@ There are exactly **two roles**:
 ```
    ┌─────────────────────────────────────┐
    │  HUB  — your laptop, or a server    │  serves the UI, holds every agent's
-   │  http://localhost:3100              │  key, fans out to the fleet
+   │  http://127.0.0.1:3100              │  key, fans out to the fleet
    └─────────────────────────────────────┘
         │  SSH tunnels (auto-reconnecting)
         ├──────────────▶ AGENT web-01   127.0.0.1:3001 ──▶ fail2ban
@@ -26,10 +26,15 @@ There are exactly **two roles**:
   server-side; those keys never reach the browser.
 
 **The hub does not have to live on a server.** Run it on your own machine and it
-opens its own SSH tunnels — `npm start`, then `http://localhost:3100`, no root
+opens its own SSH tunnels — `npm start`, then `http://127.0.0.1:3100`, no root
 and nothing left running afterwards. Or run it on a management box (or one of
 the monitored servers) and share it over SSH. Part B covers both; the agents are
 identical either way.
+
+**You install from the hub, not on the servers.** `hub/enroll.sh user@host` does
+the whole server side over SSH — see *Fresh install* below. Part A documents what
+it does, step by step, for when you'd rather do it yourself or need to know
+exactly what lands on a production box.
 
 > **Scope.** The hub is a *live* aggregator: it queries agents on demand and
 > stores no history. An offline server shows as offline rather than showing
@@ -41,59 +46,129 @@ identical either way.
 
 ---
 
-## Runbook — the order to do things in
+## Fresh install — start to finish
 
-The detail is in Parts A and B; this is the sequence, so you always know what's
-next. Roughly 20 minutes for the first server, ~5 for each one after.
+**Set up the hub first, then enroll each server from it.** Everything that has
+to happen on a monitored server happens over SSH, from the hub, in one command.
+About 10 minutes for the first server and under a minute for each one after.
 
-Do the servers first, the UI machine second — the hub needs a key that only
-exists once an agent has been installed.
+Everything below runs on **the machine you want the dashboard on** — your own
+laptop is fine, and is the usual choice. You never log in to a monitored server
+to install anything.
 
-> **One command instead of Part A.** Once you have a hub set up,
-> `bash hub/enroll.sh youruser@SERVER_IP` does everything in the first table
-> below over SSH — install, sudoers, service, verify — and registers the server
-> here with its key, so the key never passes through a clipboard. Use
-> `--dry-run` first to see the pre-flight without changing anything. The manual
-> steps stay documented because you should know what it does to your box.
+### 1. Prepare the hub (once)
 
-**On each monitored server** (Part A; ~10 minutes for the first, ~5 after):
+```bash
+git clone https://github.com/virgotex/fail2ban-dashboard.git
+cd fail2ban-dashboard
+bash setup.sh hub --local        # generates HUB_API_SECRET, builds the UI
+```
 
-| # | Do this | You're done when |
+### 2. Make sure the hub can reach each server, and won't be banned by it
+
+Two prerequisites per server, both on the *server* side, and both there for the
+same reason — the hub connects over SSH and keeps that connection open:
+
+```bash
+ssh-copy-id youruser@SERVER_IP                      # key auth, if not already
+ssh -o BatchMode=yes youruser@SERVER_IP true        # must not prompt
+```
+
+Then exempt the hub's address from that server's jails — see
+[*Step 0*](#step-0--key-based-ssh-is-a-prerequisite). Skip this and fail2ban will
+eventually ban your dashboard, and with an allports action your shell with it.
+
+The server also needs fail2ban already installed and running, with whatever jails
+you use. This tool monitors fail2ban; it does not configure it.
+
+### 3. Enroll each server (one command each)
+
+```bash
+bash hub/enroll.sh --dry-run youruser@SERVER_IP     # pre-flight only, changes nothing
+bash hub/enroll.sh youruser@SERVER_IP               # then for real
+```
+
+Optional: `--id web-01 --name "Web 01"` to set how it appears in the UI
+(otherwise derived from the hostname), `--install-node` if the server has no
+Node.js 18+, `--no-service` to skip systemd.
+
+Each run, over a single SSH connection: pre-flights the box, installs the agent
+into `/opt/fail2ban-dashboard`, grants it scoped `sudo` for `fail2ban-client` and
+`adm` for log reads, installs and starts the `fail2ban-agent` service, verifies
+`/api/health` and `/api/status`, then registers the server in `hub/servers.json`
+on the next free tunnel port — copying its `API_SECRET` straight across, so the
+two can never disagree. It prompts for the server user's sudo password.
+
+Re-running it on an enrolled server updates the code and keeps the existing key,
+which makes it the upgrade path as well as the install path.
+
+### 4. Start the dashboard
+
+```bash
+cd hub && npm start
+```
+
+One `[tunnel] <id> up` line per server, then quiet. Open
+**http://127.0.0.1:3100** — use `127.0.0.1`, not `localhost`
+(see [*Gotchas*](#gotchas)).
+
+### 5. The rest of the fleet
+
+Repeat steps 2 and 3 per server. Nothing else changes — a fleet is just more
+enrollments:
+
+```bash
+bash hub/enroll.sh --id web-01 --name "Web 01"  deploy@203.0.113.10
+bash hub/enroll.sh --id web-02 --name "Web 02"  deploy@203.0.113.11
+bash hub/enroll.sh --id db-01  --name "DB 01"   deploy@203.0.113.12
+
+cd hub && npm start        # → three rows in the fleet overview
+```
+
+Each enrollment appends to `hub/servers.json` itself, on the next free tunnel
+port (4101, 4102, 4103…), with that agent's own key. You never hand-edit the file
+and never copy a key.
+
+**Restart the hub after enrolling** — `servers.json` is read at startup only.
+
+The monitored servers never learn about each other and cannot add themselves:
+the fleet list exists only in `servers.json` on the hub machine, and the only way
+into it is you running `enroll.sh`. Each row's data — jails, bans, logs, reports —
+is fetched live from that server's own agent when you look at it.
+
+To drop a server: delete its entry, restart the hub, and optionally uninstall its
+agent ([A7](#a7--removing-an-agent-rollback)).
+
+---
+
+### What each side ends up with
+
+| | Monitored server | Hub machine |
 |---|---|---|
-| 0 | Add the hub's IP to `ignoreip` (*Step 0*) | `fail2ban-client get sshd ignoreip` lists it |
-| 1 | A0 pre-flight: `fail2ban-client ping`, `node -v` ≥ 18, port 3001 free, note your login user | all five checks pass |
-| 2 | A4 install: clone to `/opt/fail2ban-dashboard`, `bash setup.sh agent` | it prints this server's `API_SECRET` |
-| 3 | A5 access: sudoers rule for `fail2ban-client`, `usermod -aG adm $USER`, **reconnect SSH** | `sudo -n fail2ban-client ping` → `pong` |
-| 4 | A6 service: install the `fail2ban-agent` unit, enable it | `/api/health` → `role":"agent"`, `/api/status` → `ok":true` |
-| 5 | Copy the `API_SECRET` (`grep '^API_SECRET' backend/.env`) | it's pasted somewhere safe for step 7 |
+| Installed | agent at `/opt/fail2ban-dashboard`, `fail2ban-agent` service on `127.0.0.1:3001` | this clone; `npm start` when you want the dashboard |
+| Holds | only its own `API_SECRET` | `HUB_API_SECRET` + every agent's key, in `servers.json` (mode 600) |
+| Exposed | nothing — loopback only, no firewall change | nothing — loopback only |
+| Web UI | none | the dashboard, at `127.0.0.1:3100` |
 
-Skip A1 (hardening) and A2 (installing fail2ban) on any live server — see *Quick
-path for an already-configured live server*.
+Things people trip on, all covered below:
 
-**On the machine the UI is accessed from** (Part B). If that's your own
-laptop/desktop, this is the whole thing — no root, no systemd, nothing left
-running:
-
-| # | Do this | You're done when |
-|---|---|---|
-| 6 | `bash setup.sh hub --local` | `HUB_API_SECRET` generated, `frontend/dist` built |
-| 7 | Edit `hub/servers.json`: **one entry per real agent, and delete the rest.** Give each a free local port (4101, 4102, …), its own `API_SECRET`, its `ssh` target | no `PASTE_` or `.example.com` left — the hub refuses to start otherwise |
-| 8 | `ssh -o BatchMode=yes youruser@SERVER_IP true` | no password prompt |
-| 9 | `cd hub && npm start` | one `[tunnel] <id> up` line per server, then quiet |
-| 10 | Open **http://127.0.0.1:3100** | a green row per server, with its real jail count |
-| 11 | Each further server: repeat 1–5 there, add an entry, restart the hub | the new row appears in the fleet overview |
-
-For a shared hub on a management server instead, steps 6–10 differ slightly
-(systemd tunnels, and viewers reach it over `ssh -L`) — follow **B-server**.
-
-Four things people trip on, all covered below:
-
-- The `API_SECRET` in `servers.json` must match that server's `backend/.env`
-  **exactly** — a mismatch is a `403` from that agent.
 - The hub machine must reach every server over SSH **without a password**.
-- **Unedited example entries** in `servers.json` cause endless tunnel-reconnect
-  noise and permanent offline rows. Delete what you don't use.
+- The hub's IP must be in each server's `ignoreip`, or fail2ban will ban it.
 - Use **`127.0.0.1:3100`, not `localhost:3100`** — see *Gotchas*.
+- If you hand-edit `servers.json`: the `apiKey` must match that server's
+  `backend/.env` exactly (a mismatch is a `403`), and **delete any unused example
+  entries** — the hub refuses to start while a `PASTE_…` key or `*.example.com`
+  target is present, because those produce endless reconnect noise and offline
+  rows that look like real outages.
+
+### Doing it by hand instead
+
+`enroll.sh` automates Part A; Part A is still documented in full, because you
+should be able to see exactly what is being done to a production box, and
+because you may want to stage the steps yourself. Read
+[Part A](#part-a--deploy-an-agent-on-each-monitored-server) for that, and
+[Part B](#part-b--set-up-the-hub) for a shared hub on a management server
+(systemd tunnels, viewers over `ssh -L`) rather than a hub on your own machine.
 
 ### Upgrading a server that ran the older single-service build
 
@@ -500,7 +575,7 @@ identical — only who opens the SSH tunnels differs:
 | Runs on | your laptop/desktop | a management server |
 | Tunnels | the hub process opens and supervises them | systemd units from `install-tunnels.sh` |
 | Needs root | no | yes, once, to install the units |
-| You reach it at | `http://localhost:3100` directly | `ssh -L 3100:…` then `http://localhost:3100` |
+| You reach it at | `http://127.0.0.1:3100` directly | `ssh -L 3100:…` then `http://127.0.0.1:3100` |
 | Each viewer needs | their own clone + SSH keys + the agent keys | just SSH access to the hub host |
 | Agent keys live | on every viewer's machine | on one hardened box |
 | Best when | one or two admins, or you want it on your own machine | a team, or you want the keys in one place |
@@ -720,7 +795,7 @@ From your **laptop** — this is the only tunnel you open by hand:
 ssh -L 3100:127.0.0.1:3100 youruser@HUB_HOST_IP
 ```
 
-Browse to **http://localhost:3100**. You land on the **Fleet overview**; pick a
+Browse to **http://127.0.0.1:3100**. You land on the **Fleet overview**; pick a
 server from the sidebar dropdown (or click its row) to drill into that server's
 Dashboard, Logs, Reports, Banned IPs and Settings. Bans and unbans apply to the
 selected server.

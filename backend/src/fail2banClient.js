@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const zlib = require('zlib');
+const net = require('net');
 
 const LOG_PATH      = process.env.FAIL2BAN_LOG   || '/var/log/fail2ban.log';
 const LOG_MAX_LINES = parseInt(process.env.LOG_MAX_LINES || '500', 10);
@@ -27,6 +28,14 @@ const AUTH_MAX_BYTES = parseInt(process.env.AUTH_MAX_BYTES || String(5 * 1024 * 
 // busy host writes well past LOG_MAX_BYTES in a week, so they get their own
 // (larger) ceiling. Read at most once per LOG_CACHE_TTL_MS.
 const HISTORY_MAX_BYTES = parseInt(process.env.HISTORY_MAX_BYTES || String(16 * 1024 * 1024), 10);
+// System logs consulted (in addition to fail2ban.log) when investigating an IP,
+// for the usernames and ports it tried. Unreadable ones are skipped silently —
+// they need the agent user in `adm`. Override for a distro that puts them
+// elsewhere, or to switch the feature off with a single empty value.
+const AUTH_LOG_PATHS = (process.env.AUTH_LOG_PATHS !== undefined
+  ? process.env.AUTH_LOG_PATHS.split(',')
+  : ['/var/log/auth.log', '/var/log/secure' /* RHEL/CentOS */, '/var/log/syslog']
+).map(p => p.trim()).filter(Boolean);
 // Use sudo so the process doesn't need to run as root.
 // The sudoers rule in docs/SECURITY.md scopes this to fail2ban-client only.
 const USE_SUDO = process.env.USE_SUDO !== 'false';
@@ -110,18 +119,68 @@ async function readLines(filePath, maxBytes, onLine, sinceMs = 0) {
   }
 }
 
-// ─── Strict IP/CIDR validator ──────────────────────────────────────────────
-const IPV4_RE = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
-const IPV6_RE = /^[0-9a-fA-F:]{2,39}(\/\d{1,3})?$/;
+// ─── Timestamps ────────────────────────────────────────────────────────────
+// Two formats reach us. fail2ban writes "2026-08-25 10:00:00"; syslog writes
+// "Aug 25 10:00:00" with no year. Comparing those as strings put every auth-log
+// event after every fail2ban one — digits sort before letters — so an IP's
+// timeline was not chronological, and the 200-event cap then sliced the bans off
+// a noisy IP entirely. Normalise both to an epoch instead.
+//
+// Both formats are written in the host's LOCAL time, so they are parsed as local.
+const SYSLOG_MONTHS = {
+  Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4,  Jun: 5,
+  Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+};
 
+function timestampToMs(ts, now = Date.now()) {
+  if (!ts) return null;
+
+  const iso = ts.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+  if (iso) {
+    const [, y, mo, d, h, mi, s] = iso;
+    return new Date(+y, +mo - 1, +d, +h, +mi, +s).getTime();
+  }
+
+  const sys = ts.match(/^([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (sys) {
+    const [, mon, d, h, mi, s] = sys;
+    const month = SYSLOG_MONTHS[mon];
+    if (month === undefined) return null;
+    // Syslog omits the year. Assume the current one, and step back a year when
+    // that would date the event in the future — which is what a December
+    // archive read in January looks like.
+    const year = new Date(now).getFullYear();
+    const at = y => new Date(y, month, +d, +h, +mi, +s).getTime();
+    const thisYear = at(year);
+    return thisYear > now + 24 * 60 * 60 * 1000 ? at(year - 1) : thisYear;
+  }
+
+  return null;
+}
+
+// 'YYYY-MM-DD' for a date, in LOCAL time. toISOString() would answer in UTC,
+// which is a different day for most of the world for part of every day.
+function localDayKey(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// ─── Strict IP/CIDR validator ──────────────────────────────────────────────
+// Node's own parser decides what an address is — a hand-rolled IPv6 regex
+// accepted nonsense like ':::' and '::::'. Everything reaching fail2ban-client
+// passes through here first.
 function validateIP(ip) {
   if (!ip || typeof ip !== 'string') return false;
-  const trimmed = ip.trim();
-  if (IPV4_RE.test(trimmed)) {
-    const parts = trimmed.split('/')[0].split('.');
-    return parts.every(p => parseInt(p, 10) <= 255);
-  }
-  return IPV6_RE.test(trimmed);
+  const parts = ip.trim().split('/');
+  if (parts.length > 2) return false;
+
+  const [addr, prefix] = parts;
+  const family = net.isIP(addr);
+  if (!family) return false;
+
+  if (prefix === undefined) return true;
+  if (!/^\d{1,3}$/.test(prefix)) return false;
+  return Number(prefix) <= (family === 4 ? 32 : 128);
 }
 
 // ─── Jail name validator (alphanumeric + hyphens only) ────────────────────
@@ -322,13 +381,18 @@ async function getReports() {
   const jailMap   = {};   // jailName -> count
   const recentBans = [];  // [{timestamp, jail, ip}]
 
-  // Build the last-7-days date keys so days with zero bans still appear
-  const today = new Date();
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date(today);
-    d.setDate(d.getDate() - i);
-    const key = d.toISOString().slice(0, 10);
-    dailyMap[key] = 0;
+  // Build the last-7-days date keys so days with zero bans still appear.
+  // LOCAL days, because that is what fail2ban stamps its lines with: keying
+  // these off toISOString() (UTC) meant that for most of the world, for part of
+  // every day, today's log lines matched no bucket at all and this morning's
+  // bans simply vanished from the trend.
+  const windowOpen = new Date();
+  windowOpen.setHours(0, 0, 0, 0);
+  windowOpen.setDate(windowOpen.getDate() - 6);
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(windowOpen);
+    d.setDate(d.getDate() + i);
+    dailyMap[localDayKey(d)] = 0;
   }
 
   // Matches lines like:
@@ -340,7 +404,7 @@ async function getReports() {
   // after a rotation, is not in the live log at all. Archives untouched since
   // the window opened are skipped, so a long retention policy costs nothing
   // here — byJail is "all time" within what that leaves.
-  const windowStart = Date.parse(`${Object.keys(dailyMap)[0]}T00:00:00Z`);
+  const windowStart = windowOpen.getTime();
   await readLines(LOG_PATH, HISTORY_MAX_BYTES, (line) => {
     const m = line.match(BAN_RE);
     if (!m) return;
@@ -388,12 +452,7 @@ async function getIPDetails(ip) {
   if (!validateIP(ip)) throw new Error('Invalid IP address');
 
   // Logs to scan — fail2ban.log first, then auth/syslog if readable
-  const LOG_PATHS = [
-    LOG_PATH,
-    '/var/log/auth.log',
-    '/var/log/secure',          // RHEL/CentOS equivalent
-    '/var/log/syslog',
-  ].filter(p => {
+  const LOG_PATHS = [LOG_PATH, ...AUTH_LOG_PATHS].filter(p => {
     try { fs.accessSync(p, fs.constants.R_OK); return true; } catch { return false; }
   });
 
@@ -438,11 +497,6 @@ async function getIPDetails(ip) {
       // Auth log format: "May 12 09:14:22"
       const authTs = line.match(/^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})/);
       if (!timestamp && authTs) timestamp = authTs[1];
-
-      if (timestamp) {
-        if (!firstSeen) firstSeen = timestamp;
-        lastSeen = timestamp;
-      }
 
       if (isFail2ban) {
         let type = 'info';
@@ -503,12 +557,28 @@ async function getIPDetails(ip) {
     });
   }
 
-  // Sort timeline by timestamp (oldest first)
+  // Sort by real time, oldest first — across both log formats. Undated lines
+  // sort FIRST, so that the 200-event cap below (which keeps the newest) drops
+  // the events we cannot place rather than the bans we can.
+  const now = Date.now();
+  const msOf = new Map();
+  for (const e of timeline) msOf.set(e, timestampToMs(e.timestamp, now));
   timeline.sort((a, b) => {
-    if (!a.timestamp) return 1;
-    if (!b.timestamp) return -1;
-    return a.timestamp.localeCompare(b.timestamp);
+    const am = msOf.get(a);
+    const bm = msOf.get(b);
+    if (am === null) return bm === null ? 0 : -1;
+    if (bm === null) return 1;
+    return am - bm;
   });
+
+  // The activity window is the first and last event we could date. Taking it
+  // from scan order instead reported whichever file happened to be read last —
+  // so "last seen" was an auth.log line from before the ban it followed.
+  const dated = timeline.filter(e => msOf.get(e) !== null);
+  if (dated.length) {
+    firstSeen = dated[0].timestamp;
+    lastSeen  = dated[dated.length - 1].timestamp;
+  }
 
   const totalBans     = Object.values(jailsHit).reduce((s, j) => s + j.bans,     0);
   const totalAttempts = Object.values(jailsHit).reduce((s, j) => s + j.attempts, 0);
@@ -545,4 +615,6 @@ module.exports = {
   getIPDetails,
   validateIP,
   validateJailName,
+  timestampToMs,
+  localDayKey,
 };

@@ -78,37 +78,41 @@ const PROXY_ALLOW = [
 ];
 
 // ─── Load + validate server registry ──────────────────────────────────────
-function loadServers() {
+// `fatal` separates the two callers. At startup a broken registry should stop
+// the hub; on reload it must only be rejected, because a half-saved edit must
+// not take a running dashboard down.
+function loadServers({ fatal = true } = {}) {
+  const fail = (...msgs) => {
+    if (!fatal) throw new Error(msgs[0].replace(/^\[hub\] /, ''));
+    for (const m of msgs) console.error(m);
+    process.exit(1);
+  };
+
   let raw;
   try {
     raw = fs.readFileSync(SERVERS_FILE, 'utf8');
   } catch (e) {
-    console.error(`[hub] Could not read ${SERVERS_FILE}: ${e.message}`);
-    console.error('[hub] Copy hub/servers.example.json to hub/servers.json and fill it in.');
-    process.exit(1);
+    fail(`[hub] Could not read ${SERVERS_FILE}: ${e.message}`,
+         '[hub] Copy hub/servers.example.json to hub/servers.json and fill it in.');
   }
   let list;
   try {
     list = JSON.parse(raw);
   } catch (e) {
-    console.error(`[hub] ${SERVERS_FILE} is not valid JSON: ${e.message}`);
-    process.exit(1);
+    fail(`[hub] ${SERVERS_FILE} is not valid JSON: ${e.message}`);
   }
   if (!Array.isArray(list) || list.length === 0) {
-    console.error('[hub] servers.json must be a non-empty JSON array.');
-    process.exit(1);
+    fail('[hub] servers.json must be a non-empty JSON array.');
   }
   const seen = new Set();
   for (const s of list) {
     if (!s.id || !/^[a-zA-Z0-9_-]{1,64}$/.test(s.id)) {
-      console.error(`[hub] Each server needs an "id" matching [a-zA-Z0-9_-]{1,64}. Bad entry: ${JSON.stringify(s)}`);
-      process.exit(1);
+      fail(`[hub] Each server needs an "id" matching [a-zA-Z0-9_-]{1,64}. Bad entry: ${JSON.stringify(s)}`);
     }
-    if (seen.has(s.id)) { console.error(`[hub] Duplicate server id: ${s.id}`); process.exit(1); }
+    if (seen.has(s.id)) fail(`[hub] Duplicate server id: ${s.id}`);
     seen.add(s.id);
     if (!s.baseUrl || !/^https?:\/\//.test(s.baseUrl)) {
-      console.error(`[hub] Server "${s.id}" needs a baseUrl starting with http:// or https://`);
-      process.exit(1);
+      fail(`[hub] Server "${s.id}" needs a baseUrl starting with http:// or https://`);
     }
     // Normalise: drop any trailing slash so we can append cleanly.
     s.baseUrl = s.baseUrl.replace(/\/+$/, '');
@@ -118,8 +122,7 @@ function loadServers() {
     // to build this agent's systemd tunnel unit. Validated here so a typo
     // surfaces at boot rather than at tunnel-install time.
     if (s.ssh !== undefined && (typeof s.ssh !== 'string' || !s.ssh.trim())) {
-      console.error(`[hub] Server "${s.id}": "ssh" must be a non-empty string like "user@host".`);
-      process.exit(1);
+      fail(`[hub] Server "${s.id}": "ssh" must be a non-empty string like "user@host".`);
     }
     if (!s.apiKey) {
       console.warn(`[hub] WARNING: server "${s.id}" has no apiKey — the agent will reject its requests.`);
@@ -128,9 +131,8 @@ function loadServers() {
     // offline row and an endless tunnel-reconnect log — indistinguishable at a
     // glance from a real server being down. Refuse to start instead.
     if (/^PASTE_/.test(s.apiKey) || /\.example\.com(:|$)/.test(s.ssh || '')) {
-      console.error(`[hub] Server "${s.id}" is still an unedited example entry.`);
-      console.error('[hub] Delete the entries you do not use from servers.json, and fill in the rest.');
-      process.exit(1);
+      fail(`[hub] Server "${s.id}" is still an unedited example entry.`,
+           '[hub] Delete the entries you do not use from servers.json, and fill in the rest.');
     }
     // An agent should be reached over a tunnel (loopback) or TLS. Plain http
     // to a remote host would put that agent's key on the wire in clear.
@@ -142,8 +144,10 @@ function loadServers() {
   return list;
 }
 
-const SERVERS = loadServers();
-const SERVER_BY_ID = new Map(SERVERS.map(s => [s.id, s]));
+// The registry is reloadable (see reloadServers), so these are `let` and must
+// always be read live — never captured in a closure at startup.
+let SERVERS = loadServers();
+let SERVER_BY_ID = new Map(SERVERS.map(s => [s.id, s]));
 // Public view of a server — never leak the agent apiKey to the browser.
 const publicServer = s => ({ id: s.id, name: s.name });
 
@@ -152,11 +156,67 @@ const tunnels = MANAGE_TUNNELS
   ? new TunnelSupervisor(SERVERS, { agentPort: AGENT_PORT, log: console.log })
   : null;
 
-if (MANAGE_TUNNELS) {
+function warnMissingSsh() {
+  if (!MANAGE_TUNNELS) return;
   const missing = SERVERS.filter(s => !s.ssh).map(s => s.id);
   if (missing.length) {
     console.warn(`[hub] HUB_MANAGE_TUNNELS is on but these servers have no "ssh" field: ${missing.join(', ')}`);
     console.warn('[hub] They will only work if something else is already forwarding their baseUrl port.');
+  }
+}
+warnMissingSsh();
+
+// ─── Reloading the registry without a restart ───────────────────────────────
+// Enrolling a server appends to servers.json, and requiring a restart to see it
+// meant every enrollment ended with dropping every healthy tunnel. Triggered by
+// SIGHUP or by the file changing on disk.
+//
+// A bad edit must not take the hub down: loadServers() exits the process on
+// invalid input, which is right at startup and wrong here, so validation runs
+// against a copy first and a broken file leaves the running registry in place.
+function reloadServers(reason) {
+  let next;
+  try {
+    next = loadServers({ fatal: false });
+  } catch (e) {
+    console.error(`[hub] reload (${reason}) rejected, keeping the current ${SERVERS.length} server(s): ${e.message}`);
+    return null;
+  }
+
+  const before = new Set(SERVERS.map(s => s.id));
+  SERVERS = next;
+  SERVER_BY_ID = new Map(SERVERS.map(s => [s.id, s]));
+  overviewCache = null;                       // it summarises a fleet that just changed
+  warnMissingSsh();
+
+  const after = new Set(SERVERS.map(s => s.id));
+  const added   = [...after].filter(id => !before.has(id));
+  const removed = [...before].filter(id => !after.has(id));
+  const sync = tunnels ? tunnels.sync(SERVERS) : { added: [], removed: [], changed: [] };
+
+  const parts = [`${SERVERS.length} server(s)`];
+  if (added.length)   parts.push(`+${added.join(',')}`);
+  if (removed.length) parts.push(`-${removed.join(',')}`);
+  if (sync.changed.length) parts.push(`~${sync.changed.join(',')} (tunnel re-pointed)`);
+  console.log(`[hub] reloaded registry (${reason}): ${parts.join(' · ')}`);
+  return { added, removed, changed: sync.changed };
+}
+
+process.on('SIGHUP', () => reloadServers('SIGHUP'));
+
+// Watching the file is what makes `enroll.sh` feel finished: the new row appears
+// without touching the hub. Debounced, because an editor's save is several
+// events and a rewrite is briefly a truncated file.
+if (process.env.HUB_WATCH_REGISTRY !== 'false') {
+  let debounce = null;
+  try {
+    fs.watch(SERVERS_FILE, () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => reloadServers('servers.json changed'), 250);
+      if (debounce.unref) debounce.unref();
+    }).unref();
+  } catch (e) {
+    console.warn(`[hub] not watching ${SERVERS_FILE} (${e.message}) — reload with SIGHUP`);
   }
 }
 

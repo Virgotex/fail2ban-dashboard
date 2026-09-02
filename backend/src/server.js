@@ -279,7 +279,19 @@ app.get('/api/ip/:ip/details',
   }
 );
 
+// Keyed per IP, so on a long-running agent this grows with every distinct
+// address anyone investigates. Bounded the same way cache.js is: drop what has
+// expired, then the oldest insertions if that wasn't enough.
 const geoCache = new Map();
+const GEO_CACHE_MAX = 500;
+function sweepGeoCache() {
+  const now = Date.now();
+  for (const [k, v] of geoCache) if (v.expiry <= now) geoCache.delete(k);
+  let excess = geoCache.size - GEO_CACHE_MAX;
+  if (excess <= 0) return;
+  for (const k of geoCache.keys()) { if (excess-- <= 0) break; geoCache.delete(k); }
+}
+
 app.get('/api/ip/:ip/geo',
   requireKey,
   param('ip').isString().isLength({ min: 2, max: 45 }),
@@ -297,6 +309,7 @@ app.get('/api/ip/:ip/geo',
       if (!upstream.ok) throw new Error(`Geo upstream returned ${upstream.status}`);
       const data = await upstream.json();
       geoCache.set(ip, { data, expiry: now + GEO_TTL_MS });
+      if (geoCache.size > GEO_CACHE_MAX) sweepGeoCache();
       res.json(data);
     } catch (e) {
       sendError(res, e, 502, 'Geo lookup failed');
